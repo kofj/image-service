@@ -253,15 +253,20 @@ func (remote *Remote) Pull() error {
 		return errors.Wrap(err, "pull image")
 	}
 
+	logrus.WithField("degist", image.Target().Digest.Encoded()).Info("desc")
+
 	// Get source image manifest descriptor matching default platform
 	descs, err := images.Children(remote.ctx, remote.client.ContentStore(), image.Target())
 	if err != nil {
 		return err
 	}
+	logrus.Infof("descs: %#v\n", descs)
 	platform := platforms.Default()
 	var sourceManifestDesc *ocispec.Descriptor
-	for _, desc := range descs {
-		if platform.Match(*desc.Platform) {
+	for i, desc := range descs {
+		logrus.Infof("descs[%d]: %#v, platform: %#v\n", i, desc, platform)
+
+		if desc.Platform == nil || platform.Match(*desc.Platform) {
 			sourceManifestDesc = &desc
 			break
 		}

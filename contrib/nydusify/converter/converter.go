@@ -101,7 +101,9 @@ func Convert(option Option) error {
 	if err = remote.Unpack(option.WorkDir, func(layerDir string) error {
 		layerID := filepath.Base(layerDir)
 
-		logrus.Infof("Building layer %s", layerID)
+		logrus.Infof("layerDir: %s", layerDir)
+		logrus.Infof("Building layer %s, parentBootstrapPath: %s, bootstrapPath: %s, backendConfig: %s\n\n", layerID, parentBootstrapPath, bootstrapPath, backendConfig)
+		logrus.Infof("targetDir: %s, blobsDir: %s", targetDir, blobsDir)
 
 		if parentBootstrapPath != "" {
 			if err := os.Rename(bootstrapPath, parentBootstrapPath); err != nil {
@@ -125,6 +127,8 @@ func Convert(option Option) error {
 		if parentBootstrapPath == "" {
 			parentBootstrapPath = filepath.Join(targetDir, "bootstrap-parent")
 		}
+
+		// time.Sleep(30e9)
 
 		// Push nydus blob layer
 		blobs, err := ioutil.ReadDir(blobsDir)
