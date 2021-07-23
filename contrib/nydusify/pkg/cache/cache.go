@@ -16,6 +16,7 @@ import (
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/backend"
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/remote"
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/utils"
+	"github.com/sirupsen/logrus"
 
 	"github.com/containerd/containerd/images"
 	digest "github.com/opencontainers/go-digest"
@@ -28,6 +29,7 @@ import (
 type Opt struct {
 	// Maximum records(bootstrap layer + blob layer) in cache image.
 	MaxRecords uint
+	Version    string
 	// Make cache image manifest compatible with the docker v2 media
 	// type defined in github.com/containerd/containerd/images.
 	DockerV2Format bool
@@ -225,12 +227,12 @@ func mergeRecord(old, new *CacheRecord) *CacheRecord {
 	return old
 }
 
-func (cache *Cache) importLayersToRecords(layers []ocispec.Descriptor) {
+func (cache *Cache) importRecordsFromLayers(layers []ocispec.Descriptor) {
 	pulledRecords := make(map[digest.Digest]*CacheRecord)
 	pushedRecords := []*CacheRecord{}
 
-	for idx := range layers {
-		record := cache.layerToRecord(&layers[idx])
+	for _, layer := range layers {
+		record := cache.layerToRecord(&layer)
 		if record != nil {
 			// Merge bootstrap and related blob layer to record
 			newRecord := mergeRecord(
@@ -239,6 +241,8 @@ func (cache *Cache) importLayersToRecords(layers []ocispec.Descriptor) {
 			)
 			pulledRecords[record.SourceChainID] = newRecord
 			pushedRecords = append(pushedRecords, newRecord)
+		} else {
+			logrus.Warnf("Strange! Build cache layer can't produce a valid record. %s", layer.Digest)
 		}
 	}
 
@@ -254,6 +258,28 @@ func (cache *Cache) Export(ctx context.Context) error {
 
 	layers := cache.exportRecordsToLayers()
 
+	// Ensure layers from manifest match with image config,
+	// this will keep compatibility when using docker pull
+	// for the image that only included bootstrap layers.
+	diffIDs := []digest.Digest{}
+	for _, layer := range layers {
+		var diffID digest.Digest
+		if layer.MediaType == utils.MediaTypeNydusBlob {
+			diffID = layer.Digest
+		} else {
+			diffID = digest.Digest(layer.Annotations[utils.LayerAnnotationUncompressed])
+		}
+		if diffID.Validate() == nil {
+			diffIDs = append(diffIDs, diffID)
+		} else {
+			logrus.Warn("Drop the entire diff id list due to an invalid diff id")
+			diffIDs = []digest.Digest{}
+			// It is possible that some existing cache images don't have diff ids,
+			// but we can't break the cache export, so just break the loop.
+			break
+		}
+	}
+
 	// Prepare empty image config, just for registry API compatibility,
 	// manifest requires a valid config field.
 	configMediaType := ocispec.MediaTypeImageConfig
@@ -262,7 +288,11 @@ func (cache *Cache) Export(ctx context.Context) error {
 	}
 	config := ocispec.Image{
 		Config: ocispec.ImageConfig{},
-		RootFS: ocispec.RootFS{},
+		RootFS: ocispec.RootFS{
+			Type: "layers",
+			// Layers from manifest must be match image config.
+			DiffIDs: diffIDs,
+		},
 	}
 	configDesc, configBytes, err := utils.MarshalToDesc(config, configMediaType)
 	if err != nil {
@@ -289,7 +319,7 @@ func (cache *Cache) Export(ctx context.Context) error {
 			Config: *configDesc,
 			Layers: layers,
 			Annotations: map[string]string{
-				utils.ManifestNydusCache: utils.ManifestNydusCacheVersion,
+				utils.ManifestNydusCache: cache.opt.Version,
 			},
 		},
 	}
@@ -331,11 +361,14 @@ func (cache *Cache) Import(ctx context.Context) error {
 	}
 
 	// Discard the cache mismatched version
-	if manifest.Annotations[utils.ManifestNydusCache] != utils.ManifestNydusCacheVersion {
-		return fmt.Errorf("Unmatched cache version %s", manifest.Annotations[utils.ManifestNydusCache])
+	if manifest.Annotations[utils.ManifestNydusCache] != cache.opt.Version {
+		return fmt.Errorf(
+			"unmatched cache image version %s, required to be %s",
+			manifest.Annotations[utils.ManifestNydusCache], cache.opt.Version,
+		)
 	}
 
-	cache.importLayersToRecords(manifest.Layers)
+	cache.importRecordsFromLayers(manifest.Layers)
 
 	return nil
 }

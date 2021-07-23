@@ -8,7 +8,10 @@ package nydus
 
 import (
 	"errors"
+	"strings"
 
+	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/config"
+	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/cache"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/filesystem/fs"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/filesystem/meta"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/process"
@@ -50,6 +53,17 @@ func WithProcessManager(pm *process.Manager) NewFSOpt {
 	}
 }
 
+func WithCacheManager(cm *cache.Manager) NewFSOpt {
+	return func(d *filesystem) error {
+		if cm == nil {
+			return errors.New("cache manager cannot be nil")
+		}
+
+		d.cacheMgr = cm
+		return nil
+	}
+}
+
 func WithVerifier(verifier *signature.Verifier) NewFSOpt {
 	return func(d *filesystem) error {
 		d.verifier = verifier
@@ -57,9 +71,9 @@ func WithVerifier(verifier *signature.Verifier) NewFSOpt {
 	}
 }
 
-func WithDaemonConfig(cfg DaemonConfig) NewFSOpt {
+func WithDaemonConfig(cfg config.DaemonConfig) NewFSOpt {
 	return func(d *filesystem) error {
-		if (DaemonConfig{}) == cfg {
+		if (config.DaemonConfig{}) == cfg {
 			return errors.New("daemon config is empty")
 		}
 		d.daemonCfg = cfg
@@ -74,11 +88,17 @@ func WithVPCRegistry(vpcRegistry bool) NewFSOpt {
 	}
 }
 
-func WithSharedDaemon(sharedDaemon bool) NewFSOpt {
+func WithDaemonMode(daemonMode string) NewFSOpt {
 	return func(d *filesystem) error {
-		if sharedDaemon {
+		mode := strings.ToLower(daemonMode)
+		switch mode {
+		case config.DaemonModeNone:
+			d.mode = fs.NoneInstance
+		case config.DaemonModeShared, config.DaemonModeSingle:
 			d.mode = fs.SingleInstance
-		} else {
+		case config.DaemonModeMultiple:
+			fallthrough
+		default:
 			d.mode = fs.MultiInstance
 		}
 		return nil

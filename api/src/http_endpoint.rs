@@ -94,7 +94,7 @@ pub enum ApiRequest {
     Umount(String),
     ConfigureDaemon(DaemonConf),
     ExportGlobalMetrics(Option<String>),
-    ExportFilesMetrics(Option<String>),
+    ExportFilesMetrics(Option<String>, bool),
     ExportAccessPatterns(Option<String>),
     ExportBackendMetrics(Option<String>),
     ExportBlobcacheMetrics(Option<String>),
@@ -152,6 +152,7 @@ pub enum HttpError {
     BlobcacheMetrics(ApiError),
     BackendMetrics(ApiError),
     FsBackendInfo(ApiError),
+    InflightMetrics(ApiError),
 }
 
 fn success_response(body: Option<String>) -> Response {
@@ -323,7 +324,9 @@ impl EndpointHandler for MetricsFilesHandler {
         match (req.method(), req.body.as_ref()) {
             (Method::Get, None) => {
                 let id = extract_query_part(req, "id");
-                let r = kicker(ApiRequest::ExportFilesMetrics(id));
+                let latest_read_files = extract_query_part(req, "latest")
+                    .map_or(false, |b| b.parse::<bool>().unwrap_or(false));
+                let r = kicker(ApiRequest::ExportFilesMetrics(id, latest_read_files));
                 Ok(convert_to_response(r, HttpError::FsFilesMetrics))
             }
             _ => Err(HttpError::BadRequest),
@@ -395,7 +398,7 @@ impl EndpointHandler for MetricsInflightHandler {
         match (req.method(), req.body.as_ref()) {
             (Method::Get, None) => {
                 let r = kicker(ApiRequest::ExportInflightMetrics);
-                Ok(convert_to_response(r, HttpError::BlobcacheMetrics))
+                Ok(convert_to_response(r, HttpError::InflightMetrics))
             }
             _ => Err(HttpError::BadRequest),
         }

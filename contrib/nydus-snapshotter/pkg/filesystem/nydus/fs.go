@@ -8,6 +8,7 @@ package nydus
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/pkg/errors"
 
+	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/config"
+	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/cache"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/daemon"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/errdefs"
 	fspkg "github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/filesystem/fs"
@@ -24,13 +27,15 @@ import (
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/process"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/signature"
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/utils/retry"
+	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/utils"
 )
 
 type filesystem struct {
 	meta.FileSystemMeta
 	manager          *process.Manager
+	cacheMgr         *cache.Manager
 	verifier         *signature.Verifier
-	daemonCfg        DaemonConfig
+	daemonCfg        config.DaemonConfig
 	vpcRegistry      bool
 	nydusdBinaryPath string
 	mode             fspkg.FSMode
@@ -111,6 +116,11 @@ func (fs *filesystem) PrepareLayer(context.Context, storage.Snapshot, map[string
 // Mount will be called when containerd snapshotter prepare remote snapshotter
 // this method will fork nydus daemon and manage it in the internal store, and indexed by snapshotID
 func (fs *filesystem) Mount(ctx context.Context, snapshotID string, labels map[string]string) (err error) {
+	// If NoneDaemon mode, we don't mount nydus on host
+	if !fs.hasDaemon() {
+		return nil
+	}
+
 	imageID, ok := labels[label.ImageRef]
 	if !ok {
 		return fmt.Errorf("failed to find image ref of snapshot %s, labels %v", snapshotID, labels)
@@ -148,6 +158,11 @@ func (fs *filesystem) Mount(ctx context.Context, snapshotID string, labels map[s
 // WaitUntilReady wait until daemon ready by snapshotID, it will wait until nydus domain socket established
 // and the status of nydusd daemon must be ready
 func (fs *filesystem) WaitUntilReady(ctx context.Context, snapshotID string) error {
+	// If NoneDaemon mode, there's no need to wait for daemon ready
+	if !fs.hasDaemon() {
+		return nil
+	}
+
 	s, err := fs.manager.GetBySnapshotID(snapshotID)
 	if err != nil {
 		return err
@@ -170,11 +185,31 @@ func (fs *filesystem) WaitUntilReady(ctx context.Context, snapshotID string) err
 }
 
 func (fs *filesystem) Umount(ctx context.Context, mountPoint string) error {
+	if !fs.hasDaemon() {
+		return nil
+	}
+
 	id := filepath.Base(mountPoint)
-	return fs.manager.DestroyBySnapshotID(id)
+	daemon, err := fs.manager.GetBySnapshotID(id)
+	if err != nil {
+		return err
+	}
+	if err := fs.manager.DestroyDaemon(daemon); err != nil {
+		return errors.Wrap(err, "destroy daemon err")
+	}
+	if err := fs.cacheMgr.DelSnapshot(daemon.ImageID); err != nil {
+		return errors.Wrap(err, "del snapshot err")
+	}
+	log.L.Debugf("remove snapshot %s\n", daemon.ImageID)
+	fs.cacheMgr.SchedGC()
+	return nil
 }
 
 func (fs *filesystem) Cleanup(ctx context.Context) error {
+	if !fs.hasDaemon() {
+		return nil
+	}
+
 	for _, d := range fs.manager.ListDaemons() {
 		err := fs.Umount(ctx, filepath.Dir(d.MountPoint()))
 		if err != nil {
@@ -185,13 +220,39 @@ func (fs *filesystem) Cleanup(ctx context.Context) error {
 }
 
 func (fs *filesystem) MountPoint(snapshotID string) (string, error) {
-	if d, err := fs.manager.GetBySnapshotID(snapshotID); err == nil {
-		if fs.mode == fspkg.SingleInstance {
-			return d.SharedMountPoint(), nil
+	if !fs.hasDaemon() {
+		// For NoneDaemon mode, just return error to use snapshotter
+		// default mount point path
+		return "", fmt.Errorf("don't need nydus daemon of snapshot %s", snapshotID)
+	} else {
+		if d, err := fs.manager.GetBySnapshotID(snapshotID); err == nil {
+			if fs.mode == fspkg.SingleInstance {
+				return d.SharedMountPoint(), nil
+			}
+			return d.MountPoint(), nil
 		}
-		return d.MountPoint(), nil
+		return "", fmt.Errorf("failed to find nydus mountpoint of snapshot %s", snapshotID)
 	}
-	return "", fmt.Errorf("failed to find nydus mountpoint of snapshot %s", snapshotID)
+}
+
+func (fs *filesystem) BootstrapFile(id string) (string, error) {
+	return daemon.GetBootstrapFile(fs.SnapshotRoot(), id)
+}
+
+func (fs *filesystem) NewDaemonConfig(labels map[string]string) (config.DaemonConfig, error) {
+	imageID, ok := labels[label.ImageRef]
+	if !ok {
+		return config.DaemonConfig{}, fmt.Errorf("no image ID found in label")
+	}
+
+	cfg, err := config.NewDaemonConfig(fs.daemonCfg, imageID, fs.vpcRegistry, labels)
+	if err != nil {
+		return config.DaemonConfig{}, err
+	}
+	// Overriding work_dir option of nyudsd config as we want to set it
+	// via snapshotter config option to let snapshotter handle blob cache GC.
+	cfg.Device.Cache.Config.WorkDir = fs.cacheMgr.CacheDir()
+	return cfg, nil
 }
 
 func (fs *filesystem) mount(d *daemon.Daemon, labels map[string]string) error {
@@ -204,9 +265,21 @@ func (fs *filesystem) mount(d *daemon.Daemon, labels map[string]string) error {
 		if err != nil {
 			return errors.Wrapf(err, "failed to shared mount")
 		}
-		return nil
+		return fs.addSnapshot(d.ImageID, labels)
 	}
-	return fs.manager.StartDaemon(d)
+	if err := fs.manager.StartDaemon(d); err != nil {
+		return errors.Wrapf(err, "start daemon err")
+	}
+	return fs.addSnapshot(d.ImageID, labels)
+}
+
+func (fs *filesystem) addSnapshot(imageID string, labels map[string]string) error {
+	blobs, err := fs.getBlobIDs(labels)
+	if err != nil {
+		return err
+	}
+	log.L.Infof("image %s with blob caches %v", imageID, blobs)
+	return fs.cacheMgr.AddSnapshot(imageID, blobs)
 }
 
 func (fs *filesystem) newDaemon(snapshotID string, imageID string) (*daemon.Daemon, error) {
@@ -228,7 +301,7 @@ func (fs *filesystem) createNewDaemon(snapshotID string, imageID string) (*daemo
 		daemon.WithConfigDir(fs.ConfigRoot()),
 		daemon.WithSnapshotDir(fs.SnapshotRoot()),
 		daemon.WithLogDir(fs.LogRoot()),
-		daemon.WithCacheDir(fs.CacheRoot()),
+		daemon.WithCacheDir(fs.cacheMgr.CacheDir()),
 		daemon.WithImageID(imageID),
 	); err != nil {
 		return nil, err
@@ -258,7 +331,7 @@ func (fs *filesystem) createSharedDaemon(snapshotID string, imageID string) (*da
 		daemon.WithAPISock(sharedDaemon.APISock()),
 		daemon.WithConfigDir(fs.ConfigRoot()),
 		daemon.WithLogDir(fs.LogRoot()),
-		daemon.WithCacheDir(fs.CacheRoot()),
+		daemon.WithCacheDir(fs.cacheMgr.CacheDir()),
 		daemon.WithImageID(imageID),
 	); err != nil {
 		return nil, err
@@ -271,9 +344,28 @@ func (fs *filesystem) createSharedDaemon(snapshotID string, imageID string) (*da
 
 // generateDaemonConfig generate Daemon configuration
 func (fs *filesystem) generateDaemonConfig(d *daemon.Daemon, labels map[string]string) error {
-	cfg, err := NewDaemonConfig(fs.daemonCfg, d, fs.vpcRegistry, labels)
+	cfg, err := config.NewDaemonConfig(fs.daemonCfg, d.ImageID, fs.vpcRegistry, labels)
 	if err != nil {
 		return errors.Wrapf(err, "failed to generate daemon config for daemon %s", d.ID)
 	}
-	return SaveConfig(cfg, d.ConfigFile())
+	// Overriding work_dir option of nyudsd config as we want to set it
+	// via snapshotter config option to let snapshotter handle blob cache GC.
+	cfg.Device.Cache.Config.WorkDir = fs.cacheMgr.CacheDir()
+	return config.SaveConfig(cfg, d.ConfigFile())
+}
+
+func (fs *filesystem) hasDaemon() bool {
+	return fs.mode != fspkg.NoneInstance
+}
+
+func (fs *filesystem) getBlobIDs(labels map[string]string) ([]string, error) {
+	idStr, ok := labels[utils.LayerAnnotationNydusBlobIDs]
+	if !ok {
+		return nil, errors.New("no blob ids found")
+	}
+	var result []string
+	if err := json.Unmarshal([]byte(idStr), &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

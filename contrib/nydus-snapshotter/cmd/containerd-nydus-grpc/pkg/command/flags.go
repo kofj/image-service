@@ -7,18 +7,21 @@
 package command
 
 import (
+	"os"
+	"path/filepath"
+	"time"
+
 	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/config"
-	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/filesystem/nydus"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"os"
 )
 
 const (
 	defaultAddress        = "/run/containerd-nydus-grpc/containerd-nydus-grpc.sock"
 	defaultLogLevel       = logrus.InfoLevel
 	defaultRootDir        = "/var/lib/containerd-nydus-grpc"
+	defaultGCPeriod       = "24h"
 	defaultPublicKey      = "/signing/nydus-image-signing-public.key"
 	defaultNydusdPath     = "/bin/nydusd"
 	defaultNydusImagePath = "/bin/nydusd-img"
@@ -29,14 +32,18 @@ type Args struct {
 	LogLevel             string
 	ConfigPath           string
 	RootDir              string
+	CacheDir             string
+	GCPeriod             string
 	ValidateSignature    bool
 	PublicKeyFile        string
 	ConvertVpcRegistry   bool
 	NydusdBinaryPath     string
 	NydusImageBinaryPath string
 	SharedDaemon         bool
+	DaemonMode           string
 	AsyncRemove          bool
 	EnableMetrics        bool
+	MetricsFile          string
 	EnableStargz         bool
 }
 
@@ -69,6 +76,18 @@ func buildFlags(args *Args) []cli.Flag {
 			Value:       defaultRootDir,
 			Usage:       "path to the root directory for this snapshotter",
 			Destination: &args.RootDir,
+		},
+		&cli.StringFlag{
+			Name:        "cache-dir",
+			Value:       "",
+			Usage:       "path to the cache dir",
+			Destination: &args.CacheDir,
+		},
+		&cli.StringFlag{
+			Name:        "gc-period",
+			Value:       defaultGCPeriod,
+			Usage:       "period for gc blob cache, for example, 1m, 2h",
+			Destination: &args.GCPeriod,
 		},
 		&cli.BoolFlag{
 			Name:        "validate-signature",
@@ -103,8 +122,14 @@ func buildFlags(args *Args) []cli.Flag {
 		&cli.BoolFlag{
 			Name:        "shared-daemon",
 			Value:       false,
-			Usage:       "whether to use a single shared nydus daemon",
+			Usage:       "Deprecated, equivalent to \"--daemon-mode shared\"",
 			Destination: &args.SharedDaemon,
+		},
+		&cli.StringFlag{
+			Name:        "daemon-mode",
+			Value:       config.DefaultDaemonMode,
+			Usage:       "daemon mode to use, could be \"multiple\", \"shared\" or \"none\"",
+			Destination: &args.DaemonMode,
 		},
 		&cli.BoolFlag{
 			Name:        "async-remove",
@@ -117,6 +142,11 @@ func buildFlags(args *Args) []cli.Flag {
 			Value:       false,
 			Usage:       "whether to collect metrics",
 			Destination: &args.EnableMetrics,
+		},
+		&cli.StringFlag{
+			Name:        "metrics-file",
+			Usage:       "file path to output metrics",
+			Destination: &args.MetricsFile,
 		},
 		&cli.BoolFlag{
 			Name:        "enable-stargz",
@@ -136,8 +166,8 @@ func NewFlags() *Flags {
 }
 
 func Validate(args *Args, cfg *config.Config) error {
-	var daemonCfg nydus.DaemonConfig
-	if err := nydus.LoadConfig(args.ConfigPath, &daemonCfg); err != nil {
+	var daemonCfg config.DaemonConfig
+	if err := config.LoadConfig(args.ConfigPath, &daemonCfg); err != nil {
 		return errors.Wrapf(err, "failed to load config file %q", args.ConfigPath)
 	}
 
@@ -148,15 +178,31 @@ func Validate(args *Args, cfg *config.Config) error {
 	}
 	cfg.DaemonCfg = daemonCfg
 	cfg.RootDir = args.RootDir
+
+	cfg.CacheDir = args.CacheDir
+	if len(cfg.CacheDir) == 0 {
+		cfg.CacheDir = filepath.Join(cfg.RootDir, "cache")
+	}
 	cfg.ValidateSignature = args.ValidateSignature
 	cfg.PublicKeyFile = args.PublicKeyFile
 	cfg.ConvertVpcRegistry = args.ConvertVpcRegistry
 	cfg.Address = args.Address
 	cfg.NydusdBinaryPath = args.NydusdBinaryPath
 	cfg.NydusImageBinaryPath = args.NydusImageBinaryPath
-	cfg.SharedDaemon = args.SharedDaemon
+	cfg.DaemonMode = args.DaemonMode
+	// Give --shared-daemon higher priority
+	if args.SharedDaemon {
+		cfg.DaemonMode = config.DaemonModeShared
+	}
 	cfg.AsyncRemove = args.AsyncRemove
 	cfg.EnableMetrics = args.EnableMetrics
+	cfg.MetricsFile = args.MetricsFile
 	cfg.EnableStargz = args.EnableStargz
+
+	d, err := time.ParseDuration(args.GCPeriod)
+	if err != nil {
+		return errors.Wrapf(err, "parse gc period %v failed", args.GCPeriod)
+	}
+	cfg.GCPeriod = d
 	return nil
 }

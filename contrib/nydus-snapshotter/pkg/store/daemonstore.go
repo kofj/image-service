@@ -9,16 +9,11 @@ package store
 import (
 	"context"
 	"fmt"
-	"github.com/pkg/errors"
-	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/daemon"
-	"path/filepath"
+	"os"
 	"sync"
-)
 
-const (
-	databaseFileName = "nydus.db"
+	"github.com/dragonflyoss/image-service/contrib/nydus-snapshotter/pkg/daemon"
 )
-
 
 type DaemonStore struct {
 	sync.Mutex
@@ -28,14 +23,7 @@ type DaemonStore struct {
 	db              *Database                 // save daemons in database
 }
 
-func NewDaemonStore(rootDir string) (*DaemonStore, error) {
-	dbfile := filepath.Join(rootDir, databaseFileName)
-
-	db, err := NewDatabase(dbfile)
-	if err != nil {
-		return &DaemonStore{}, errors.Wrapf(err, "failed to new database")
-	}
-
+func NewDaemonStore(db *Database) (*DaemonStore, error) {
 	return &DaemonStore{
 		idxBySnapshotID: make(map[string]*daemon.Daemon),
 		idxByID:         make(map[string]*daemon.Daemon),
@@ -49,7 +37,7 @@ func (s *DaemonStore) Get(id string) (*daemon.Daemon, error) {
 	if d, ok := s.idxByID[id]; ok {
 		return d, nil
 	}
-	return nil, fmt.Errorf("failed to get daemon by id (%s)", id)
+	return nil, os.ErrNotExist
 }
 
 func (s *DaemonStore) GetBySnapshot(snapshotID string) (*daemon.Daemon, error) {
@@ -58,7 +46,8 @@ func (s *DaemonStore) GetBySnapshot(snapshotID string) (*daemon.Daemon, error) {
 	if d, ok := s.idxBySnapshotID[snapshotID]; ok {
 		return d, nil
 	}
-	return nil, fmt.Errorf("failed to get daemon by snapshotID (%s)", snapshotID)
+
+	return nil, os.ErrNotExist
 }
 
 func (s *DaemonStore) List() []*daemon.Daemon {
@@ -120,6 +109,6 @@ func (s *DaemonStore) WalkDaemons(ctx context.Context, cb func(d *daemon.Daemon)
 	return s.db.WalkDaemons(ctx, cb)
 }
 
-func (s *DaemonStore) CleanupDatabase(ctx context.Context) error {
-	return s.db.Cleanup(ctx)
+func (s *DaemonStore) CleanupDaemons(ctx context.Context) error {
+	return s.db.CleanupDaemons(ctx)
 }

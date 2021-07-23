@@ -45,7 +45,7 @@ impl FuseSession {
     pub fn new(mountpoint: &Path, fsname: &str, subtype: &str) -> io::Result<FuseSession> {
         let dest = mountpoint.canonicalize()?;
         if !dest.is_dir() {
-            return Err(enotdir!(format!("{:?} is not a directory", dest)));
+            return Err(enotdir!());
         }
 
         Ok(FuseSession {
@@ -256,8 +256,17 @@ fn fuse_kern_mount(
         .create(false)
         .read(true)
         .write(true)
-        .open(FUSE_DEVICE)?;
-    let meta = mountpoint.metadata()?;
+        .open(FUSE_DEVICE)
+        .map_err(|e| {
+            error!("FUSE failed to open. {}", e);
+            e
+        })?;
+
+    let meta = mountpoint.metadata().map_err(|e| {
+        error!("Can not get metadata from mount point. {}", e);
+        e
+    })?;
+
     let opts = format!(
         "default_permissions,allow_other,fd={},rootmode={:o},user_id={},group_id={}",
         file.as_raw_fd(),

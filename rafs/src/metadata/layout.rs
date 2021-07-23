@@ -29,7 +29,6 @@
 //! Giving above definition, we could get the inode object for an inode number or child index as:
 //!    inode_ptr = sb_base_ptr + inode_offset_from_sb(inode_number)
 //!    inode_ptr = sb_base_ptr + inode_offset_from_sb(child_index)
-
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::ffi::{OsStr, OsString};
@@ -40,15 +39,17 @@ use std::os::unix::ffi::OsStrExt;
 
 use serde::Serialize;
 
+use crate::metadata::extended::blob_table::ExtendedBlobTable;
 use nydus_utils::{
     digest::{self, RafsDigest},
     ByteSize,
 };
+use storage::device::RafsBlobEntry;
 
 use super::*;
 
 pub const RAFS_SUPERBLOCK_SIZE: usize = 8192;
-pub const RAFS_SUPERBLOCK_RESERVED_SIZE: usize = RAFS_SUPERBLOCK_SIZE - 72;
+pub const RAFS_SUPERBLOCK_RESERVED_SIZE: usize = RAFS_SUPERBLOCK_SIZE - 80;
 pub const RAFS_SUPER_MAGIC: u32 = 0x5241_4653;
 pub const RAFS_SUPER_VERSION_V4: u32 = 0x400;
 pub const RAFS_SUPER_VERSION_V5: u32 = 0x500;
@@ -147,12 +148,14 @@ pub struct OndiskSuperBlock {
     s_blob_table_offset: u64,
     /// V5: Size of inode table
     s_inode_table_entries: u32,
-    s_prefetch_table_entries: u32,
+    s_prefetch_table_entries: u32, // 64 bytes
     /// V5: Entries of blob table
     s_blob_table_size: u32,
-    s_reserved: u32,
+    s_extended_blob_table_entries: u32, // 72 bytes
+    /// Extended Blob Table
+    s_extended_blob_table_offset: u64, // 80 bytes --- reduce me from `RAFS_SUPERBLOCK_RESERVED_SIZE`
     /// Unused area
-    s_reserved2: [u8; RAFS_SUPERBLOCK_RESERVED_SIZE],
+    s_reserved: [u8; RAFS_SUPERBLOCK_RESERVED_SIZE],
 }
 
 bitflags! {
@@ -247,8 +250,9 @@ impl Default for OndiskSuperBlock {
             s_prefetch_table_entries: u32::to_le(0),
             s_blob_table_size: u32::to_le(0),
             s_blob_table_offset: u64::to_le(0),
-            s_reserved: u32::to_le(0),
-            s_reserved2: [0u8; RAFS_SUPERBLOCK_RESERVED_SIZE],
+            s_extended_blob_table_offset: u64::to_le(0),
+            s_extended_blob_table_entries: u32::to_le(0),
+            s_reserved: [0u8; RAFS_SUPERBLOCK_RESERVED_SIZE],
         }
     }
 }
@@ -349,6 +353,18 @@ impl OndiskSuperBlock {
         s_prefetch_table_entries,
         u32
     );
+    impl_pub_getter_setter!(
+        extended_blob_table_offset,
+        set_extended_blob_table_offset,
+        s_extended_blob_table_offset,
+        u64
+    );
+    impl_pub_getter_setter!(
+        extended_blob_table_entries,
+        set_extended_blob_table_entries,
+        s_extended_blob_table_entries,
+        u32
+    );
 
     pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
         r.read_exact(self.as_mut())
@@ -374,7 +390,7 @@ impl fmt::Display for OndiskSuperBlock {
 
 #[derive(Clone, Default)]
 pub struct OndiskInodeTable {
-    pub(crate) data: Vec<u32>,
+    pub data: Vec<u32>,
 }
 
 impl OndiskInodeTable {
@@ -405,6 +421,8 @@ impl OndiskInodeTable {
             return Err(einval!("invalid inode number"));
         }
 
+        // The offset is aligned with 8 bytes to make it easier to
+        // validate OndiskInode.
         let offset = inode_offset >> 3;
         self.data[(ino - 1) as usize] = offset as u32;
 
@@ -442,7 +460,9 @@ impl RafsStore for OndiskInodeTable {
 
 #[derive(Clone, Default)]
 pub struct PrefetchTable {
-    pub inode_indexes: Vec<u32>,
+    /// Store inode numbers of files that have to prefetch.
+    /// Note: It's not inode index of inodes table being stored here.
+    pub inodes: Vec<u32>,
 }
 
 /// Introduce a prefetch table to rafs v5 disk layout.
@@ -456,21 +476,19 @@ pub struct PrefetchTable {
 /// when rafs is mounted at the very beginning.
 impl PrefetchTable {
     pub fn new() -> PrefetchTable {
-        PrefetchTable {
-            inode_indexes: vec![],
-        }
+        PrefetchTable { inodes: vec![] }
     }
 
     pub fn len(&self) -> usize {
-        self.inode_indexes.len()
+        self.inodes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inode_indexes.is_empty()
+        self.inodes.is_empty()
     }
 
-    pub fn add_entry(&mut self, inode_idx: u32) {
-        self.inode_indexes.push(inode_idx);
+    pub fn add_entry(&mut self, ino: u32) {
+        self.inodes.push(ino);
     }
 
     pub fn size(&self) -> usize {
@@ -480,14 +498,14 @@ impl PrefetchTable {
     pub fn store(&mut self, w: &mut RafsIoWriter) -> Result<usize> {
         // Sort prefetch table by inode index, hopefully, it can save time when mounting rafs
         // Because file data is dumped in the order of inode index.
-        self.inode_indexes.sort_unstable();
+        self.inodes.sort_unstable();
 
-        let (_, data, _) = unsafe { self.inode_indexes.align_to::<u8>() };
+        let (_, data, _) = unsafe { self.inodes.align_to::<u8>() };
 
         w.write_all(data.as_ref())?;
 
         // OK. Let's see if we have to align... :-(
-        let cur_len = self.inode_indexes.len() * size_of::<u32>();
+        let cur_len = self.inodes.len() * size_of::<u32>();
         let padding_bytes = align_to_rafs(cur_len) - cur_len;
         w.write_padding(padding_bytes)?;
 
@@ -502,39 +520,34 @@ impl PrefetchTable {
         r: &mut RafsIoReader,
         offset: u64,
         table_size: usize,
-    ) -> RafsResult<()> {
-        self.inode_indexes = vec![0u32; table_size];
-        let (_, data, _) = unsafe { self.inode_indexes.align_to_mut::<u8>() };
+    ) -> nix::Result<usize> {
+        self.inodes = vec![0u32; table_size];
+        let (_, data, _) = unsafe { self.inodes.align_to_mut::<u8>() };
         nix::sys::uio::pread(r.as_raw_fd(), data, offset as i64)
-            .map_err(|e| RafsError::Prefetch(e.to_string()))?;
-
-        Ok(())
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct OndiskBlobTableEntry {
-    // Blob's own meta should be put onto its head, so `u32` should be sufficient.
-    pub readahead_offset: u32,
-    pub readahead_size: u32,
-    pub blob_id: String,
+fn pointer_offset(former_ptr: *const u8, later_ptr: *const u8) -> usize {
+    // Rust provides unsafe method `offset_from` from 1.47.0
+    // Hopefully, we can adopt it someday. For now, for compatibility, use blow trick.
+    later_ptr as usize - former_ptr as usize
 }
 
-impl OndiskBlobTableEntry {
-    pub fn size(&self) -> usize {
-        size_of::<u32>() * 2 + self.blob_id.len()
-    }
-}
-
+// TODO: FIXME: This is not a well defined disk structure
 #[derive(Clone, Debug, Default)]
 pub struct OndiskBlobTable {
-    pub entries: Vec<OndiskBlobTableEntry>,
+    pub entries: Vec<Arc<RafsBlobEntry>>,
+    pub extended: ExtendedBlobTable,
 }
+
+// A helper to extract blob table entries from disk.
+struct BlobEntryFrontPart(u32, u32);
 
 impl OndiskBlobTable {
     pub fn new() -> Self {
         OndiskBlobTable {
             entries: Vec::new(),
+            extended: ExtendedBlobTable::new(),
         }
     }
 
@@ -545,84 +558,142 @@ impl OndiskBlobTable {
         }
         // Blob entry split with '\0'
         align_to_rafs(
-            self.entries
-                .iter()
-                .fold(0usize, |size, entry| size + entry.size() + 1)
-                - 1,
+            self.entries.iter().fold(0usize, |size, entry| {
+                let entry_size = size_of::<u32>() * 2 + entry.blob_id.len();
+                size + entry_size + 1
+            }) - 1,
         )
     }
 
-    pub fn add(&mut self, blob_id: String, readahead_offset: u32, readahead_size: u32) -> u32 {
-        self.entries.push(OndiskBlobTableEntry {
+    pub fn add(
+        &mut self,
+        blob_id: String,
+        readahead_offset: u32,
+        readahead_size: u32,
+        chunk_count: u32,
+        blob_cache_size: u64,
+        compressed_blob_size: u64,
+    ) -> u32 {
+        let blob_index = self.entries.len() as u32;
+        self.entries.push(Arc::new(RafsBlobEntry {
             blob_id,
+            blob_index,
             readahead_offset,
             readahead_size,
-        });
-        (self.entries.len() - 1) as u32
+            chunk_count,
+            blob_cache_size,
+        }));
+        self.extended
+            .add(chunk_count, blob_cache_size, compressed_blob_size);
+        blob_index
     }
 
     #[inline]
-    pub fn get(&self, blob_index: u32) -> Result<OndiskBlobTableEntry> {
+    pub fn get(&self, blob_index: u32) -> Result<Arc<RafsBlobEntry>> {
         if blob_index > (self.entries.len() - 1) as u32 {
             return Err(enoent!("blob not found"));
         }
         Ok(self.entries[blob_index as usize].clone())
     }
 
-    pub fn load(&mut self, r: &mut RafsIoReader, size: usize) -> Result<()> {
-        let mut input = vec![0u8; size];
+    // The goal is to fill `entries` according to blob table. If it is zero-sized,
+    // just return Ok.
+    pub fn load(&mut self, r: &mut RafsIoReader, blob_table_size: u32) -> Result<()> {
+        if blob_table_size == 0 {
+            return Ok(());
+        }
 
-        r.read_exact(&mut input)?;
-        self.load_from_slice(&input)
-    }
-    pub fn load_from_slice(&mut self, input: &[u8]) -> Result<()> {
-        let mut input_rest = input;
+        let mut data = vec![0u8; blob_table_size as usize];
+        r.read_exact(&mut data)?;
 
+        let begin_ptr = data.as_slice().as_ptr() as *const u8;
+        let mut frame = begin_ptr;
+        debug!("blob table size {}", blob_table_size);
         loop {
-            let split_at_64 = std::mem::size_of::<u64>();
-            let split_at_32 = std::mem::size_of::<u32>();
+            // Each entry frame looks like:
+            // u32 | u32 | string | trailing '\0' , except that the last entry has no trailing '\0'
+            // Make clippy of 1.45 happy. Higher version of clippy won't complain about this
+            #[allow(clippy::cast_ptr_alignment)]
+            let front = unsafe { &*(frame as *const BlobEntryFrontPart) };
+            // `blob_table_size` has to be greater than zero, otherwise it access a invalid page.
+            let readahead_offset = front.0;
+            let readahead_size = front.1;
 
-            if input_rest.len() < split_at_64 + 1 {
-                break;
-            }
-            let (readahead, rest) = input_rest.split_at(split_at_64);
+            // Safe because we never tried to take ownership.
+            // Make clippy of 1.45 happy. Higher version of clippy won't complain about this
+            #[allow(clippy::cast_ptr_alignment)]
+            let id_offset = unsafe { (frame as *const BlobEntryFrontPart).add(1) as *const u8 };
+            // id_end points to the byte before splitter 'b\0'
+            let id_end = Self::blob_id_tail_ptr(id_offset, begin_ptr, blob_table_size as usize);
 
-            if readahead.len() < split_at_32 + 1 {
-                break;
-            }
-            let (readahead_offset, readahead_size) = readahead.split_at(split_at_32);
+            // Excluding trailing '\0'.
+            // Note: we can't use string.len() to move pointer.
+            let bytes_len = pointer_offset(id_offset, id_end) + 1;
 
-            let readahead_offset =
-                u32::from_le_bytes(readahead_offset.try_into().map_err(|e| einval!(e))?);
-            let readahead_size =
-                u32::from_le_bytes(readahead_size.try_into().map_err(|e| einval!(e))?);
+            let id_bytes = unsafe { std::slice::from_raw_parts(id_offset, bytes_len) };
 
-            let (blob_id, rest) = parse_string(rest)?;
+            let blob_id = std::str::from_utf8(id_bytes).map_err(|e| einval!(e))?;
+            debug!("blob {:?} lies on", blob_id);
+            // Move to next entry frame, including splitter 0
+            frame = unsafe { frame.add(size_of::<BlobEntryFrontPart>() + bytes_len + 1) };
 
-            self.entries.push(OndiskBlobTableEntry {
-                blob_id: blob_id.to_string(),
+            let index = self.entries.len();
+
+            // For compatibility concern, blob table might not associate with extended blob table.
+            let (chunk_count, blob_cache_size) = if !self.extended.entries.is_empty() {
+                // chge: Though below can hardly happen and we can do nothing meeting
+                // this possibly due to bootstrap corruption, someone like this kind of check, make them happy.
+                if index > self.extended.entries.len() - 1 {
+                    error!(
+                        "Extended blob table({}) is shorter than blob table",
+                        self.extended.entries.len()
+                    );
+                    return Err(einval!());
+                }
+                (
+                    self.extended.entries[index].chunk_count,
+                    self.extended.entries[index].blob_cache_size,
+                )
+            } else {
+                (0, 0)
+            };
+
+            self.entries.push(Arc::new(RafsBlobEntry {
+                blob_id: blob_id.to_owned(),
+                blob_index: index as u32,
+                chunk_count,
                 readahead_offset,
                 readahead_size,
-            });
+                blob_cache_size,
+            }));
 
-            // Break blob id search loop, when rest bytes length is zero,
-            // or not split with '\0', or not have enough data to read (ending with padding data).
-            if rest.is_empty()
-                || rest.as_bytes()[0] != b'\0'
-                || rest.as_bytes().len() <= (size_of::<u32>() * 2 + 1)
-            {
+            if align_to_rafs(pointer_offset(begin_ptr, frame)) as u32 >= blob_table_size {
                 break;
             }
-
-            // Skip '\0' splitter for next search
-            input_rest = &rest.as_bytes()[1..];
         }
 
         Ok(())
     }
 
-    pub fn get_all(&self) -> Vec<OndiskBlobTableEntry> {
+    pub fn get_all(&self) -> Vec<Arc<RafsBlobEntry>> {
         self.entries.clone()
+    }
+
+    pub fn store_extended(&self, w: &mut RafsIoWriter) -> Result<usize> {
+        self.extended.store(w)
+    }
+
+    fn blob_id_tail_ptr(cur: *const u8, begin_ptr: *const u8, total_size: usize) -> *const u8 {
+        let mut id_end = cur as *mut u8;
+        loop {
+            let next_byte = unsafe { id_end.add(1) };
+            // b'\0' is the splitter
+            if unsafe { *next_byte } == 0 || pointer_offset(begin_ptr, next_byte) >= total_size {
+                return id_end;
+            }
+
+            id_end = unsafe { id_end.add(1) };
+        }
     }
 }
 
@@ -760,6 +831,12 @@ impl OndiskInode {
     pub fn has_hole(&self) -> bool {
         self.i_flags.contains(RafsInodeFlags::HAS_HOLE)
     }
+
+    pub fn file_name(&self, r: &mut RafsIoReader) -> Result<OsString> {
+        let mut name_buf = vec![0u8; self.i_name_size as usize];
+        r.read_exact(name_buf.as_mut_slice())?;
+        Ok(bytes_to_os_str(&name_buf).to_os_string())
+    }
 }
 
 pub struct OndiskInodeWrapper<'a> {
@@ -804,25 +881,26 @@ impl_bootstrap_converter!(OndiskInode);
 #[derive(Default, Clone, Copy, Debug)]
 pub struct OndiskChunkInfo {
     /// sha256(chunk), [char; RAFS_SHA256_LENGTH]
-    pub block_id: RafsDigest,
+    pub block_id: RafsDigest, // 32
     /// blob index (blob_id = blob_table[blob_index])
     pub blob_index: u32,
     /// chunk flags
-    pub flags: RafsChunkFlags,
-
+    pub flags: RafsChunkFlags, // 40
     /// compressed size in blob
     pub compress_size: u32,
     /// decompressed size in blob
-    pub decompress_size: u32,
+    pub decompress_size: u32, // 48
     /// compressed offset in blob
-    pub compress_offset: u64,
+    pub compress_offset: u64, // 56
     /// decompressed offset in blob
-    pub decompress_offset: u64,
-
+    pub decompress_offset: u64, // 64
     /// offset in file
-    pub file_offset: u64,
+    pub file_offset: u64, // 72
+    /// chunk index, it's allocated sequentially
+    /// starting from 0 for one blob.
+    pub index: u32,
     /// reserved
-    pub reserved: u64,
+    pub reserved: u32, //80
 }
 
 impl OndiskChunkInfo {
@@ -848,7 +926,7 @@ impl fmt::Display for OndiskChunkInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "file_offset {}, compress_offset {}, compress_size {}, decompress_offset {}, decompress_size {}, blob_index {}, block_id {}, is_compressed {}",
+            "file_offset {}, compress_offset {}, compress_size {}, decompress_offset {}, decompress_size {}, blob_index {}, block_id {}, index {}, is_compressed {}",
             self.file_offset,
             self.compress_offset,
             self.compress_size,
@@ -856,6 +934,7 @@ impl fmt::Display for OndiskChunkInfo {
             self.decompress_size,
             self.blob_index,
             self.block_id,
+            self.index,
             self.flags.contains(RafsChunkFlags::COMPRESSED),
         )
     }
@@ -1054,4 +1133,93 @@ pub fn parse_xattr_value(data: &[u8], size: usize, name: &OsStr) -> Result<Optio
     })?;
 
     Ok(value)
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::OndiskBlobTable;
+    use crate::RafsIoReader;
+    use nydus_utils::setup_logging;
+    use std::fs::OpenOptions;
+    use std::io::{SeekFrom, Write};
+    use vmm_sys_util::tempfile::TempFile;
+
+    #[allow(dead_code)]
+    struct Entry {
+        foo: u32,
+        bar: u32,
+    }
+
+    unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
+        ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
+    }
+
+    #[test]
+    fn test_load_blob_table() {
+        setup_logging(None, log::LevelFilter::Info).unwrap();
+
+        let mut buffer = Vec::new();
+        let first = Entry { foo: 1, bar: 2 };
+        let second = Entry { foo: 3, bar: 4 };
+        let third = Entry { foo: 5, bar: 6 };
+
+        let first_id = "355d403e35d7120cbd6a145874a2705e6842ce9974985013ebdc1fa5199a0184";
+        let second_id = "19ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e26023ad0ecd61d4b130019ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e26023ad0ecd61d4";
+        let third_id = "19ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e";
+
+        let first_slice = unsafe { any_as_u8_slice(&first) };
+        let second_slice = unsafe { any_as_u8_slice(&second) };
+        let third_slice = unsafe { any_as_u8_slice(&third) };
+
+        buffer.extend_from_slice(first_slice);
+        buffer.extend_from_slice(first_id.as_bytes());
+        buffer.push(b'\0');
+        buffer.extend_from_slice(second_slice);
+        buffer.extend_from_slice(second_id.as_bytes());
+        buffer.push(b'\0');
+        buffer.extend_from_slice(third_slice);
+        buffer.extend_from_slice(third_id.as_bytes());
+        // buffer.push(b'\0');
+
+        let tmp_file = TempFile::new().unwrap();
+
+        // Store extended blob table
+        let mut tmp_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp_file.as_path())
+            .unwrap();
+
+        tmp_file.write_all(&buffer).unwrap();
+        tmp_file.flush().unwrap();
+
+        let mut file: RafsIoReader = Box::new(tmp_file);
+        let mut blob_table = OndiskBlobTable::new();
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        blob_table.load(&mut file, buffer.len() as u32).unwrap();
+
+        for b in &blob_table.entries {
+            let _c = b.clone();
+            trace!("{:?}", _c);
+        }
+
+        assert_eq!(blob_table.entries[0].blob_id, first_id);
+        assert_eq!(blob_table.entries[1].blob_id, second_id);
+        assert_eq!(blob_table.entries[2].blob_id, third_id);
+
+        blob_table.entries.truncate(0);
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        blob_table.load(&mut file, 0).unwrap();
+
+        blob_table.entries.truncate(0);
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        blob_table
+            .load(&mut file, (buffer.len() - 100) as u32)
+            .unwrap();
+
+        assert_eq!(blob_table.entries[0].blob_id, first_id);
+    }
 }

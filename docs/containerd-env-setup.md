@@ -2,16 +2,17 @@
 
 This document will walk through how to setup a nydus image service to work with containerd. It assumes that you already have containerd installed. If not, please refer to [containerd documents](https://github.com/containerd/containerd/blob/master/docs/ops.md) on how to install and set it up.
 
-## Build and Install all nydus binaries
+### Install all nydus binaries
+
+Get `nydus-image`, `nydusd`, `nydusify`, and `containerd-nydus-grpc` binaries from [release](https://github.com/dragonflyoss/image-service/releases/latest) page.
+
 ```bash
-make release
-make nydusify
-make nydus-snapshotter
-sudo cp target-fusedev/release/nydusd target-fusedev/release/nydus-image /usr/local/bin
-sudo cp contrib/nydusify/cmd/nydusify contrib/nydus-snapshotter/bin/containerd-nydus-grpc /usr/local/bin
+sudo cp nydusd nydus-image /usr/local/bin
+sudo cp nydusify containerd-nydus-grpc /usr/local/bin
 ```
 
 ## Start containerd snapshotter for nydus
+
 Nydus provides a containerd remote snapshotter `containerd-nydus-grpc` to prepare container rootfs with nydus formatted images. To start it, first save a nydusd config to `/etc/nydusd-config.json`:
 ```bash
 $ cat > /etc/nydusd-config.json << EOL
@@ -51,10 +52,12 @@ Then start `containerd-nydus-grpc` remote snapshotter:
     --config-path /etc/nydusd-config.json \
     --log-level debug \
     --root /var/lib/containerd/io.containerd.snapshotter.v1.nydus \
+    --cache-dir /var/lib/nydus/cache \
     --address /run/containerd/containerd-nydus-grpc.sock
 ```
-
+`cache-dir` argument represent the blob cache root dir, if unset, it will be set `root` + "/cache". It overrides the `work_dir` option in nydusd-config.json.
 ## Configure and Start containerd
+
 Nydus uses two features of containerd:
 * remote snapshotter
 * snapshotter annotations
@@ -77,17 +80,21 @@ systemctl restart containerd
 ```
 
 ## Start A Local Registry Container
+
 ```bash
 docker run -d --restart=always -p 5000:5000 registry
 ```
 
 ## Convert An Image To Nydus Format
+
 ```bash
 nydusify convert --nydus-image /usr/local/bin/nydus-image --source ubuntu --target localhost:5000/ubuntu-nydus
 ```
 
 ## Create New Pods With Nydus Format Image
+
 For example, use the following `cat pod-config.yaml` and `container-config.yaml`
+
 ```
 $ cat pod-config.yaml
 metadata:
@@ -117,6 +124,7 @@ log_path: container.1.log
 ```
 
 To create a new pod with the just converted nydus image:
+
 ```
 $ crictl run container-config.yaml pod-config.yaml
 77f5a5c87d37dde96afbd6a950fbff49402a95073b11f952aa3a572c7113d151

@@ -6,7 +6,6 @@ package converter
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +68,7 @@ type Opt struct {
 
 	CacheRemote     *remote.Remote
 	CacheMaxRecords uint
+	CacheVersion    string
 
 	NydusImagePath string
 	WorkDir        string
@@ -77,8 +77,12 @@ type Opt struct {
 	MultiPlatform  bool
 	DockerV2Format bool
 
-	BackendType   string
-	BackendConfig string
+	BackendType      string
+	BackendConfig    string
+	BackendForcePush bool
+
+	NydusifyVersion string
+	Source          string
 }
 
 type Converter struct {
@@ -89,6 +93,7 @@ type Converter struct {
 
 	CacheRemote     *remote.Remote
 	CacheMaxRecords uint
+	CacheVersion    string
 
 	NydusImagePath string
 	WorkDir        string
@@ -96,6 +101,11 @@ type Converter struct {
 
 	MultiPlatform  bool
 	DockerV2Format bool
+
+	BackendForcePush bool
+
+	NydusifyVersion string
+	Source          string
 
 	storageBackend backend.Backend
 }
@@ -109,42 +119,33 @@ func New(opt Opt) (*Converter, error) {
 	}
 
 	return &Converter{
-		Logger:          opt.Logger,
-		SourceProviders: opt.SourceProviders,
-		TargetRemote:    opt.TargetRemote,
-		CacheRemote:     opt.CacheRemote,
-		CacheMaxRecords: opt.CacheMaxRecords,
-		NydusImagePath:  opt.NydusImagePath,
-		WorkDir:         opt.WorkDir,
-		PrefetchDir:     opt.PrefetchDir,
-		MultiPlatform:   opt.MultiPlatform,
-		DockerV2Format:  opt.DockerV2Format,
+		Logger:           opt.Logger,
+		SourceProviders:  opt.SourceProviders,
+		TargetRemote:     opt.TargetRemote,
+		CacheRemote:      opt.CacheRemote,
+		CacheMaxRecords:  opt.CacheMaxRecords,
+		CacheVersion:     opt.CacheVersion,
+		NydusImagePath:   opt.NydusImagePath,
+		WorkDir:          opt.WorkDir,
+		PrefetchDir:      opt.PrefetchDir,
+		MultiPlatform:    opt.MultiPlatform,
+		DockerV2Format:   opt.DockerV2Format,
+		BackendForcePush: opt.BackendForcePush,
+		NydusifyVersion:  opt.NydusifyVersion,
+		Source:           opt.Source,
 
 		storageBackend: backend,
 	}, nil
 }
 
-func findSupportedSource(ctx context.Context, sources []provider.SourceProvider) (provider.SourceProvider, error) {
-	for _, source := range sources {
-		config, err := source.Config(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, "Failed to get image config from source provider")
-		}
-		if utils.IsSupportedPlatform(config.OS, config.Architecture) {
-			return source, nil
-		}
-	}
-	return nil, fmt.Errorf("not found supported platform in source image")
-}
-
 func (cvt *Converter) convert(ctx context.Context) error {
 	logger = cvt.Logger
 
-	logrus.Infoln(fmt.Sprintf("Converting to %s", cvt.TargetRemote.Ref))
+	logrus.Infof("Converting to %s", cvt.TargetRemote.Ref)
 
 	// Try to pull Nydus cache image from remote registry
 	cg, err := newCacheGlue(
-		ctx, cvt.CacheMaxRecords, cvt.DockerV2Format, cvt.TargetRemote, cvt.CacheRemote, cvt.storageBackend,
+		ctx, cvt.CacheMaxRecords, cvt.CacheVersion, cvt.DockerV2Format, cvt.TargetRemote, cvt.CacheRemote, cvt.storageBackend,
 	)
 	if err != nil {
 		return errors.Wrap(err, "Pull cache image")
@@ -170,11 +171,13 @@ func (cvt *Converter) convert(ctx context.Context) error {
 	if cvt.SourceProviders == nil || len(cvt.SourceProviders) == 0 {
 		return errors.New("Invalid source provider")
 	}
-	sourceProvider, err := findSupportedSource(ctx, cvt.SourceProviders)
-	if err != nil {
-		return errors.Wrap(err, "Find supported platform")
+
+	// In fact, during parsing image manifest, only one interested tag is inserted.
+	if len(cvt.SourceProviders) != 1 {
+		return errors.New("Should have only one source image")
 	}
 
+	sourceProvider := cvt.SourceProviders[0]
 	sourceLayers, err := sourceProvider.Layers(ctx)
 	if err != nil {
 		return errors.Wrap(err, "Get source layers")
@@ -196,6 +199,7 @@ func (cvt *Converter) convert(ctx context.Context) error {
 			parent:         parentBuildLayer,
 			dockerV2Format: cvt.DockerV2Format,
 			backend:        cvt.storageBackend,
+			forcePush:      cvt.BackendForcePush,
 		}
 		parentBuildLayer = buildLayer
 		buildLayers = append(buildLayers, buildLayer)
@@ -258,6 +262,21 @@ func (cvt *Converter) convert(ctx context.Context) error {
 		return errors.Wrap(err, "Push Nydus layer in wait")
 	}
 
+	// Collect all meta information of current build environment, it will be
+	// written to manifest annotations of Nydus image for easy debugging and
+	// troubleshooting afterwards.
+	buildInfo := NewBuildInfo()
+	buildInfo.SetBuilderVersion(buildWorkflow.BuilderVersion)
+	buildInfo.SetNydusifyVersion(cvt.NydusifyVersion)
+	sourceManifest, err := sourceProvider.Manifest(ctx)
+	if err != nil {
+		return errors.Wrap(err, "Get source manifest")
+	}
+	buildInfo.SetSourceReference(SourceReference{
+		Reference: cvt.Source,
+		Digest:    sourceManifest.Digest.String(),
+	})
+
 	// Push OCI manifest, Nydus manifest and manifest index
 	mm := &manifestManager{
 		sourceProvider: sourceProvider,
@@ -265,6 +284,7 @@ func (cvt *Converter) convert(ctx context.Context) error {
 		backend:        cvt.storageBackend,
 		multiPlatform:  cvt.MultiPlatform,
 		dockerV2Format: cvt.DockerV2Format,
+		buildInfo:      buildInfo,
 	}
 	pushDone := logger.Log(ctx, "[MANI] Push manifest", nil)
 	if err := mm.Push(ctx, buildLayers); err != nil {
@@ -285,7 +305,7 @@ func (cvt *Converter) convert(ctx context.Context) error {
 		return errors.Wrap(err, "Get cache record")
 	}
 
-	logrus.Infoln(fmt.Sprintf("Converted to %s", cvt.TargetRemote.Ref))
+	logrus.Infof("Converted to %s", cvt.TargetRemote.Ref)
 
 	return nil
 }

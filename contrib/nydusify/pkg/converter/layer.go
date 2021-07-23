@@ -53,6 +53,7 @@ type buildLayer struct {
 	blobPath        string
 	bootstrapPath   string
 	backend         backend.Backend
+	forcePush       bool
 }
 
 // parseSourceMount parses mounts object returned by the Mount method in
@@ -104,19 +105,13 @@ func parseSourceMount(mounts []mount.Mount) (*sourceMount, error) {
 	}
 }
 
-func (layer *buildLayer) pushBlob(ctx context.Context) error {
+func (layer *buildLayer) pushBlob(ctx context.Context, blobSize int64) error {
 	// Note: filepath.Base(blobPath) is a sha256 hex string
 	blobPath := layer.blobPath
 	blobID := filepath.Base(blobPath)
 
-	info, err := os.Stat(blobPath)
-	if err != nil {
-		return errors.Wrap(err, "Stat blob file")
-	}
-
 	if err := utils.WithRetry(func() error {
-		size := info.Size()
-		desc, err := layer.backend.Upload(ctx, blobID, blobPath, size)
+		desc, err := layer.backend.Upload(ctx, blobID, blobPath, blobSize, layer.forcePush)
 		if err != nil {
 			return err
 		}
@@ -208,6 +203,9 @@ func (layer *buildLayer) Push(ctx context.Context) error {
 		if err != nil {
 			return errors.Wrap(err, "Get blob layer size")
 		}
+		// Once upload is complete, clean up the blob file to save disk space.
+		defer os.Remove(layer.blobPath)
+
 		blobSize := humanize.Bytes(uint64(info.Size()))
 		var op string
 		if layer.backend.Type() == backend.OssBackend {
@@ -219,7 +217,7 @@ func (layer *buildLayer) Push(ctx context.Context) error {
 			"Digest": blobDigest,
 			"Size":   blobSize,
 		})
-		if err := layer.pushBlob(ctx); err != nil {
+		if err := layer.pushBlob(ctx, info.Size()); err != nil {
 			return pushDone(errors.Wrapf(err, "Push Nydus blob layer"))
 		}
 
@@ -298,6 +296,8 @@ func (layer *buildLayer) Build(ctx context.Context) error {
 	if err != nil {
 		return buildDone(errors.Wrapf(err, "Build source layer %s", layer.source.Digest()))
 	}
+
+	// The built blob will be removed after `upload` phrase.
 	layer.blobPath = blobPath
 
 	return buildDone(nil)

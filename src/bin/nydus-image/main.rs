@@ -13,14 +13,15 @@ extern crate nydus_utils;
 mod trace;
 
 mod builder;
-mod node;
-mod stargz;
-mod tree;
+mod core;
+mod inspect;
 mod validator;
 
 #[macro_use]
 extern crate log;
 extern crate serde;
+#[macro_use]
+extern crate serde_json;
 #[macro_use]
 extern crate lazy_static;
 
@@ -29,113 +30,85 @@ const BLOB_ID_MAXIMUM_LENGTH: usize = 1024;
 use anyhow::{bail, Context, Result};
 use clap::{App, Arg, SubCommand};
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs::metadata;
 use std::fs::OpenOptions;
-use std::io;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{getegid, geteuid};
 use serde::Serialize;
 
-use builder::{BlobStorage, SourceType};
-use node::WhiteoutSpec;
+use crate::builder::directory::DirectoryBuilder;
+use crate::builder::stargz::StargzBuilder;
+use crate::builder::Builder;
+
+use crate::core::blob::BlobStorage;
+use crate::core::context::BuildContext;
+use crate::core::context::SourceType;
+use crate::core::context::BUF_WRITER_CAPACITY;
+use crate::core::node::{self, ChunkCountMap, WhiteoutSpec};
+use crate::core::prefetch::Prefetch;
+use crate::core::tree;
+
 use nydus_utils::{digest, setup_logging, BuildTimeInfo};
+use rafs::metadata::layout::OndiskBlobTable;
+use rafs::RafsIoReader;
 use storage::compress;
 use trace::{EventTracerClass, TimingTracerClass, TraceClass};
 use validator::Validator;
 
 #[derive(Serialize, Default)]
 pub struct ResultOutput {
+    version: String,
     blobs: Vec<String>,
     trace: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ResultOutput {
-    fn dump<W>(&self, writer: W) -> Result<()>
-    where
-        W: io::Write,
-    {
-        serde_json::to_writer(writer, &self).context("Write output file failed")
-    }
-}
+    fn dump(
+        matches: &clap::ArgMatches,
+        build_info: &BuildTimeInfo,
+        blob_ids: Vec<String>,
+    ) -> Result<()> {
+        let output_json: Option<PathBuf> = matches
+            .value_of("output-json")
+            .map(|o| o.to_string().into());
 
-fn dump_result_output(matches: &clap::ArgMatches, blob_ids: Vec<String>) -> Result<()> {
-    let output_json: Option<PathBuf> = matches
-        .value_of("output-json")
-        .map(|o| o.to_string().into());
+        if let Some(ref f) = output_json {
+            let w = OpenOptions::new()
+                .truncate(true)
+                .create(true)
+                .write(true)
+                .open(f)
+                .with_context(|| format!("Output file {:?} can't be opened", f))?;
 
-    if let Some(ref f) = output_json {
-        let w = OpenOptions::new()
-            .truncate(true)
-            .create(true)
-            .write(true)
-            .open(f)
-            .with_context(|| format!("{:?} can't be opened", f))?;
+            let trace = root_tracer!().dump_summary_map().unwrap_or_default();
+            let version = format!("{}-{}", build_info.package_ver, build_info.git_commit);
+            let output = Self {
+                version,
+                trace,
+                blobs: blob_ids,
+            };
 
-        let trace = root_tracer!().dump_summary_map().unwrap_or_default();
-
-        ResultOutput {
-            trace,
-            blobs: blob_ids,
-        }
-        .dump(w)?;
-    }
-
-    Ok(())
-}
-
-/// Gather readahead file paths line by line from stdin
-/// Input format:
-///    printf "/relative/path/to/rootfs/1\n/relative/path/to/rootfs/1"
-/// This routine does not guarantee that specified file must exist in local filesystem,
-/// this is because we can't guarantee that source rootfs directory of parent bootstrap
-/// is located in local file system.
-fn gather_readahead_files() -> Result<BTreeMap<PathBuf, Option<u64>>> {
-    let stdin = io::stdin();
-    let mut files = BTreeMap::new();
-
-    loop {
-        let mut file = String::new();
-
-        let size = stdin
-            .read_line(&mut file)
-            .context("failed to parse readahead files")?;
-        if size == 0 {
-            break;
-        }
-        let file_trimmed: PathBuf = file.trim().into();
-        // Sanity check for the list format.
-        if !file_trimmed.starts_with(Path::new("/")) {
-            warn!(
-                "Illegal file path specified. It {:?} must start with '/'",
-                file
-            );
-            continue;
+            serde_json::to_writer(w, &output).context("Write output file failed")?;
         }
 
-        debug!(
-            "readahead file: {}, trimmed file name {:?}",
-            file, file_trimmed
-        );
-        // The inode index is not decided yet, but will do during fs-walk.
-        files.insert(file_trimmed, None);
+        Ok(())
     }
-
-    Ok(files)
 }
 
 fn main() -> Result<()> {
-    let (bti_string, _) = BuildTimeInfo::dump(crate_version!());
+    let (bti_string, build_info) = BuildTimeInfo::dump(crate_version!());
 
     // TODO: Try to use yaml to define below options
-    let cmd = App::new("nydus image builder")
+    let cmd = App::new("")
         .version(bti_string.as_str())
         .author(crate_authors!())
         .about("Build image using nydus format.")
         .subcommand(
             SubCommand::with_name("create")
-                .about("dump image bootstrap and upload blob to storage backend")
+                .about("Create a nydus format accelerated container image")
                 .arg(
                     Arg::with_name("SOURCE")
                         .help("source path")
@@ -275,6 +248,30 @@ fn main() -> Result<()> {
                         .takes_value(true)
                 )
         )
+        .subcommand(
+            SubCommand::with_name("inspect")
+                .about("Inspect nydus format")
+                .arg(
+                    Arg::with_name("bootstrap")
+                        .long("bootstrap")
+                        .help("bootstrap path")
+                        .required(true)
+                        .takes_value(true),
+                )
+                .arg(
+                    Arg::with_name("request")
+                        .long("request")
+                        .short("R")
+                        .help("Inspect image in request mode")
+                        .required(false)
+                        .takes_value(true),
+                )
+                .arg(
+                    Arg::with_name("blob-dir").help("A directory holding all layers related to a single image")
+                        .long("blob-dir").required(false)
+                        .takes_value(true)
+                )
+        )
         .arg(
             Arg::with_name("log-level")
                 .long("log-level")
@@ -296,10 +293,10 @@ fn main() -> Result<()> {
     register_tracer!(TraceClass::Event, EventTracerClass);
 
     if let Some(matches) = cmd.subcommand_matches("create") {
-        let source_path = Path::new(matches.value_of("SOURCE").unwrap());
+        let source_path = PathBuf::from(matches.value_of("SOURCE").unwrap());
         let source_type: SourceType = matches.value_of("source-type").unwrap().parse()?;
 
-        let source_file = metadata(source_path)
+        let source_file = metadata(&source_path)
             .context(format!("failed to get source path {:?}", source_path))?;
 
         let mut blob_id = String::new();
@@ -378,53 +375,87 @@ fn main() -> Result<()> {
             None
         };
 
-        let mut parent_bootstrap = Path::new("");
-        if let Some(_parent_bootstrap) = matches.value_of("parent-bootstrap") {
-            parent_bootstrap = Path::new(_parent_bootstrap);
+        let mut parent_bootstrap_path = Path::new("");
+        if let Some(_parent_bootstrap_path) = matches.value_of("parent-bootstrap") {
+            parent_bootstrap_path = Path::new(_parent_bootstrap_path);
         }
-
-        let prefetch_policy = matches
-            .value_of("prefetch-policy")
-            .unwrap_or_default()
-            .parse()?;
-
-        let hint_readahead_files = if prefetch_policy != builder::PrefetchPolicy::None {
-            gather_readahead_files().context("failed to get readahead files")?
-        } else {
-            BTreeMap::new()
-        };
 
         let whiteout_spec: WhiteoutSpec = matches
             .value_of("whiteout-spec")
             .unwrap_or_default()
             .parse()?;
 
+        let prefetch_policy = matches
+            .value_of("prefetch-policy")
+            .unwrap_or_default()
+            .parse()?;
+        let prefetch = Prefetch::new(prefetch_policy)?;
+
         let aligned_chunk = matches.is_present("aligned-chunk");
 
-        // External tool like `nydusify` might rename the blob to a OCI distribution compatible one.
-        let mut ib = builder::Builder::new(
+        let f_bootstrap = Box::new(BufWriter::with_capacity(
+            BUF_WRITER_CAPACITY,
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(bootstrap_path)
+                .with_context(|| format!("failed to create bootstrap file {:?}", bootstrap_path))?,
+        ));
+
+        let f_parent_bootstrap: Option<RafsIoReader> = if parent_bootstrap_path != Path::new("") {
+            Some(Box::new(
+                OpenOptions::new()
+                    .read(true)
+                    .write(false)
+                    .open(parent_bootstrap_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to open parent bootstrap file {:?}",
+                            parent_bootstrap_path
+                        )
+                    })?,
+            ))
+        } else {
+            None
+        };
+
+        let mut ctx = BuildContext {
             source_type,
             source_path,
-            blob_stor,
-            bootstrap_path,
-            parent_bootstrap,
             blob_id,
+            f_bootstrap,
+            f_parent_bootstrap,
             compressor,
             digester,
-            hint_readahead_files,
-            prefetch_policy,
-            !repeatable,
+            explicit_uidgid: !repeatable,
             whiteout_spec,
             aligned_chunk,
+            prefetch,
+
+            lower_inode_map: HashMap::new(),
+            upper_inode_map: HashMap::new(),
+            chunk_cache: HashMap::new(),
+            chunk_count_map: ChunkCountMap::default(),
+            blob_table: OndiskBlobTable::new(),
+            nodes: Vec::new(),
+        };
+
+        let mut builder: Box<dyn Builder> = match source_type {
+            SourceType::Directory => {
+                Box::new(DirectoryBuilder::new(blob_stor.as_ref().unwrap().clone()))
+            }
+            SourceType::StargzIndex => Box::new(StargzBuilder::new()),
+        };
+        let (blob_ids, blob_size) = timing_tracer!(
+            { builder.build(&mut ctx).context("build failed") },
+            "total_build"
         )?;
 
         // Some operations like listing xattr pairs of certain namespace need the process
         // to be privileged. Therefore, trace what euid and egid are
         event_tracer!("euid", "{}", geteuid());
         event_tracer!("egid", "{}", getegid());
-
-        let (blob_ids, blob_size) =
-            timing_tracer!({ ib.build().context("build failed") }, "total_build")?;
 
         // Validate output bootstrap file
         if !matches.is_present("disable-check") {
@@ -439,7 +470,7 @@ fn main() -> Result<()> {
             )?;
         }
 
-        dump_result_output(matches, blob_ids.clone())?;
+        ResultOutput::dump(matches, &build_info, blob_ids.clone())?;
 
         info!(
             "Image build(size={}Bytes) successfully. Blobs table: {:?}",
@@ -456,7 +487,27 @@ fn main() -> Result<()> {
 
         info!("bootstrap is valid, blobs: {:?}", blob_ids);
 
-        dump_result_output(matches, blob_ids)?;
+        ResultOutput::dump(matches, &build_info, blob_ids)?;
+    }
+
+    if let Some(matches) = cmd.subcommand_matches("inspect") {
+        // Safe to unwrap since `bootstrap` has default value.
+        let bootstrap_path = Path::new(matches.value_of("bootstrap").unwrap());
+        let cmd = matches.value_of("request");
+
+        let mut inspector =
+            inspect::RafsInspector::new(bootstrap_path, cmd.is_some()).map_err(|e| {
+                error!("Failed to instantiate inspector, {:?}", e);
+                e
+            })?;
+
+        if let Some(c) = cmd {
+            let o = inspect::Executor::execute(&mut inspector, c.to_string()).unwrap();
+            serde_json::to_writer(std::io::stdout(), &o)
+                .unwrap_or_else(|e| error!("Failed to serialize, {:?}", e));
+        } else {
+            inspect::Prompt::run(inspector);
+        }
     }
 
     Ok(())

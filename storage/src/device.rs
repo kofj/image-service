@@ -44,6 +44,7 @@ bitflags! {
 pub trait RafsChunkInfo: Sync + Send {
     fn block_id(&self) -> &RafsDigest;
     fn blob_index(&self) -> u32;
+    fn index(&self) -> u32;
     fn compress_offset(&self) -> u64;
     fn compress_size(&self) -> u32;
     fn decompress_offset(&self) -> u64;
@@ -90,6 +91,10 @@ impl RafsDevice {
         digester: digest::Algorithm,
         id: &str,
     ) -> io::Result<()> {
+        // Stop prefetch if it is running before swapping backend since prefetch
+        // threads cloned Arc<Cache>, the swap operation can't drop inner object completely.
+        // Otherwise prefetch threads will be leaked.
+        self.stop_prefetch().unwrap_or_else(|e| error!("{:?}", e));
         self.rw_layer.store(Arc::new(factory::new_rw_layer(
             config, compressor, digester, id,
         )?));
@@ -184,7 +189,7 @@ impl FileReadWriteVolatile for RafsBioDevice<'_> {
         self.dev
             .rw_layer
             .load()
-            .write(&self.bio.blob_id, self.bio.chunkinfo.as_ref(), buf)
+            .write(&self.bio.blob.blob_id, self.bio.chunkinfo.as_ref(), buf)
     }
 }
 
@@ -208,6 +213,29 @@ impl RafsBioDevice<'_> {
         }
 
         Ok(count)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RafsBlobEntry {
+    /// Number of chunks in blob file.
+    /// A helper to distinguish bootstrap with extended blob table or not:
+    ///     Bootstrap with extended blob table always has non-zero `chunk_count`
+    pub chunk_count: u32,
+    /// The data range to be prefetched in blob file.
+    pub readahead_offset: u32,
+    pub readahead_size: u32,
+    /// A sha256 hex string generally.
+    pub blob_id: String,
+    /// The index of blob in RAFS blob table.
+    pub blob_index: u32,
+    /// The expected decompress size of blob cache file.
+    pub blob_cache_size: u64,
+}
+
+impl RafsBlobEntry {
+    pub fn with_extended_blob_table(&self) -> bool {
+        self.chunk_count != 0
     }
 }
 
@@ -235,8 +263,8 @@ impl RafsBioDesc {
 pub struct RafsBio {
     /// reference to the chunk
     pub chunkinfo: Arc<dyn RafsChunkInfo>,
-    /// blob id of chunk
-    pub blob_id: String,
+    /// reference to the blob where the chunk is located
+    pub blob: Arc<RafsBlobEntry>,
     /// offset within the chunk
     pub offset: u32,
     /// size within the chunk
@@ -248,14 +276,14 @@ pub struct RafsBio {
 impl RafsBio {
     pub fn new(
         chunkinfo: Arc<dyn RafsChunkInfo>,
-        blob_id: String,
+        blob: Arc<RafsBlobEntry>,
         offset: u32,
         size: usize,
         blksize: u32,
     ) -> Self {
         RafsBio {
             chunkinfo,
-            blob_id,
+            blob,
             offset,
             size,
             blksize,

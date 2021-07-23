@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Result};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use fuse_rs::abi::linux_abi;
@@ -30,9 +31,9 @@ pub struct CachedInodes {
 }
 
 impl CachedInodes {
-    pub fn new(meta: RafsSuperMeta, blobs: OndiskBlobTable, digest_validate: bool) -> Self {
+    pub fn new(meta: RafsSuperMeta, digest_validate: bool) -> Self {
         CachedInodes {
-            s_blob: Arc::new(blobs),
+            s_blob: Arc::new(OndiskBlobTable::new()),
             s_inodes: BTreeMap::new(),
             s_meta: Arc::new(meta),
             digest_validate,
@@ -42,10 +43,17 @@ impl CachedInodes {
     /// v5 layout is based on BFS, which means parents always are in front of children
     fn load_all_inodes(&mut self, r: &mut RafsIoReader) -> Result<()> {
         let mut dir_ino_set = Vec::new();
+        let mut entries = 0;
         loop {
+            // Stopping after loading all inodes helps to append possible
+            // new structure to the tail of bootstrap in the future.
+            if entries >= self.s_meta.inode_table_entries {
+                break;
+            }
             let mut inode = CachedInode::new(self.s_blob.clone(), self.s_meta.clone());
             match inode.load(&self.s_meta, r) {
                 Ok(_) => {
+                    entries += 1;
                     trace!(
                         "got inode ino {} parent {} size {} child_idx {} child_cnt {}",
                         inode.ino(),
@@ -113,6 +121,38 @@ impl CachedInodes {
 
 impl RafsSuperInodes for CachedInodes {
     fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+        // FIXME: add validator for all load operations.
+
+        // Now the seek offset points to inode table, so we can easily
+        // find first inode offset.
+        r.seek(SeekFrom::Start(self.s_meta.inode_table_offset))?;
+        let mut offset = [0u8; size_of::<u32>()];
+        r.read_exact(&mut offset)?;
+        // The offset is aligned with 8 bytes to make it easier to
+        // validate OndiskInode.
+        let inode_offset = u32::from_le_bytes(offset) << 3;
+
+        // Load blob table.
+        r.seek(SeekFrom::Start(self.s_meta.blob_table_offset))?;
+        let mut blob_table = OndiskBlobTable::new();
+        let meta = &self.s_meta;
+
+        // Load extended blob table if the bootstrap including
+        // extended blob table.
+        if meta.extended_blob_table_offset > 0 {
+            r.seek(SeekFrom::Start(meta.extended_blob_table_offset))?;
+            blob_table
+                .extended
+                .load(r, meta.extended_blob_table_entries as usize)?;
+        }
+
+        r.seek(SeekFrom::Start(meta.blob_table_offset))?;
+        blob_table.load(r, meta.blob_table_size)?;
+
+        self.s_blob = Arc::new(blob_table);
+
+        // Load all inodes started from first inode offset.
+        r.seek(SeekFrom::Start(inode_offset as u64))?;
         self.load_all_inodes(r)?;
 
         // Validate inode digest tree
@@ -191,7 +231,7 @@ impl CachedInode {
             r.read_exact(name_buf.as_mut_slice())?;
             self.i_name = bytes_to_os_str(&name_buf).to_os_string();
         }
-        r.try_seek_aligned(name_size);
+        r.seek_to_next_aligned(name_size)?;
         Ok(())
     }
 
@@ -201,7 +241,7 @@ impl CachedInode {
             r.read_exact(symbol_buf.as_mut_slice())?;
             self.i_target = bytes_to_os_str(&symbol_buf).to_os_string();
         }
-        r.try_seek_aligned(symlink_size);
+        r.seek_to_next_aligned(symlink_size)?;
         Ok(())
     }
 
@@ -329,8 +369,8 @@ impl RafsInode for CachedInode {
     }
 
     #[inline]
-    fn get_chunk_blob_id(&self, idx: u32) -> Result<String> {
-        Ok(self.i_blob_table.get(idx)?.blob_id)
+    fn get_blob_by_index(&self, idx: u32) -> Result<Arc<RafsBlobEntry>> {
+        Ok(self.i_blob_table.get(idx)?)
     }
 
     #[inline]
@@ -404,7 +444,7 @@ impl RafsInode for CachedInode {
         descendants: &mut Vec<Arc<dyn RafsInode>>,
     ) -> Result<usize> {
         if !self.is_dir() {
-            return Err(enotdir!(""));
+            return Err(enotdir!());
         }
 
         let mut child_dirs: Vec<Arc<dyn RafsInode>> = Vec::new();
@@ -468,6 +508,8 @@ pub struct CachedChunkInfo {
     c_block_id: Arc<RafsDigest>,
     // blob containing the block
     c_blob_index: u32,
+    // chunk index in blob
+    c_index: u32,
     // position of the block within the file
     c_file_offset: u64,
     // offset of the block within the blob
@@ -498,6 +540,7 @@ impl CachedChunkInfo {
     fn copy_from_ondisk(&mut self, chunk: &OndiskChunkInfo) {
         self.c_block_id = Arc::new(chunk.block_id);
         self.c_blob_index = chunk.blob_index;
+        self.c_index = chunk.index;
         self.c_compress_offset = chunk.compress_offset;
         self.c_decompress_offset = chunk.decompress_offset;
         self.c_decompress_size = chunk.decompress_size;
@@ -521,6 +564,7 @@ impl RafsChunkInfo for CachedChunkInfo {
     }
 
     impl_getter!(blob_index, c_blob_index, u32);
+    impl_getter!(index, c_index, u32);
     impl_getter!(compress_offset, c_compress_offset, u64);
     impl_getter!(compress_size, c_compr_size, u32);
     impl_getter!(decompress_offset, c_decompress_offset, u64);
@@ -697,14 +741,14 @@ mod cached_tests {
         let mut blob_table = Arc::new(OndiskBlobTable::new());
         Arc::get_mut(&mut blob_table)
             .unwrap()
-            .add(String::from("123333"), 0, 0);
+            .add(String::from("123333"), 0, 0, 0, 0, 0);
         let mut cached_inode = CachedInode::new(blob_table, meta.clone());
         cached_inode.load(&meta, &mut reader).unwrap();
         let desc1 = cached_inode.alloc_bio_desc(0, 100).unwrap();
         assert_eq!(desc1.bi_size, 100);
         assert_eq!(desc1.bi_vec.len(), 1);
         assert_eq!(desc1.bi_vec[0].offset, 0);
-        assert_eq!(desc1.bi_vec[0].blob_id, "123333");
+        assert_eq!(desc1.bi_vec[0].blob.blob_id, "123333");
 
         let desc2 = cached_inode.alloc_bio_desc(1024 * 1024 - 100, 200).unwrap();
         assert_eq!(desc2.bi_size, 200);
