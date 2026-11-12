@@ -1,0 +1,583 @@
+// Copyright (C) 2020-2022 Alibaba Cloud. All rights reserved.
+// Copyright 2020 Ant Group. All rights reserved.
+// Copyright 2019 Intel Corporation. All Rights Reserved.
+//
+// SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
+
+//! Infrastructure to define and implement filesystem services.
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, MutexGuard};
+
+use fuse_backend_rs::abi::fuse_abi::ROOT_ID;
+#[cfg(target_os = "linux")]
+use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions, Layer};
+use fuse_backend_rs::api::vfs::VfsError;
+use fuse_backend_rs::api::{BackFileSystem, Vfs};
+#[cfg(target_os = "linux")]
+use fuse_backend_rs::overlayfs::{config::Config as overlay_config, OverlayFs};
+#[cfg(target_os = "linux")]
+use fuse_backend_rs::passthrough::{CachePolicy, Config as passthrough_config, PassthroughFs};
+use nydus_api::ConfigV2;
+use nydus_rafs::fs::Rafs;
+use nydus_rafs::metadata::RafsInode;
+use nydus_rafs::{RafsError, RafsIoRead};
+use nydus_storage::factory::BLOB_FACTORY;
+use serde::{Deserialize, Serialize};
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
+
+use crate::upgrade::UpgradeManager;
+use crate::{Error, FsBackendDescriptor, FsBackendType, Result};
+
+/// Request structure to mount a filesystem instance.
+#[derive(Clone, Versionize, Debug)]
+pub struct FsBackendMountCmd {
+    /// Filesystem type.
+    pub fs_type: FsBackendType,
+    /// Mount source.
+    pub source: String,
+    /// Configuration information for the mount operation.
+    pub config: String,
+    /// Filesystem mountpoint.
+    pub mountpoint: String,
+    /// Optional prefetch file list.
+    pub prefetch_files: Option<Vec<String>>,
+}
+
+/// Request structure to unmount a filesystem instance.
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct FsBackendUmountCmd {
+    /// Filesystem mountpoint.
+    pub mountpoint: String,
+}
+
+/// List of [FsBackendDescriptor], providing filesystem metrics and statistics information.
+#[derive(Default, Serialize, Clone)]
+pub struct FsBackendCollection(HashMap<String, FsBackendDescriptor>);
+
+impl FsBackendCollection {
+    fn add(&mut self, id: &str, cmd: &FsBackendMountCmd) -> Result<()> {
+        // We only wash Rafs backend now.
+        let fs_config = match cmd.fs_type {
+            FsBackendType::Rafs => {
+                let cfg = ConfigV2::from_str(&cmd.config)
+                    .map_err(|e| Error::InvalidConfig(format!("{}", e)))?;
+                let cfg = cfg.clone_without_secrets();
+                Some(cfg)
+            }
+            FsBackendType::PassthroughFs => {
+                // Passthrough Fs has no configuration information.
+                None
+            }
+        };
+
+        let desc = FsBackendDescriptor {
+            backend_type: cmd.fs_type.clone(),
+            mountpoint: cmd.mountpoint.clone(),
+            mounted_time: time::OffsetDateTime::now_utc(),
+            config: fs_config,
+        };
+
+        self.0.insert(id.to_string(), desc);
+
+        Ok(())
+    }
+
+    pub fn del(&mut self, id: &str) {
+        self.0.remove(id);
+    }
+}
+
+/// Abstract interfaces for filesystem service provider.
+pub trait FsService: Send + Sync {
+    /// Get the [Vfs](https://docs.rs/fuse-backend-rs/latest/fuse_backend_rs/api/vfs/struct.Vfs.html)
+    /// object associated with the filesystem service object.
+    fn get_vfs(&self) -> &Vfs;
+
+    /// Get the [BackFileSystem](https://docs.rs/fuse-backend-rs/latest/fuse_backend_rs/api/vfs/type.BackFileSystem.html)
+    /// object associated with a mount point.
+    fn backend_from_mountpoint(&self, mp: &str) -> Result<Option<(Arc<BackFileSystem>, u8)>> {
+        self.get_vfs().get_rootfs(mp).map_err(|e| e.into())
+    }
+
+    /// Get handle to the optional upgrade manager.
+    fn upgrade_mgr(&self) -> Option<MutexGuard<'_, UpgradeManager>>;
+
+    /// Mount a new filesystem instance.
+    // NOTE: This method is not thread-safe, however, it is acceptable as
+    // mount/umount/remount/restore_mount is invoked from single thread in FSM
+    fn mount(&self, cmd: FsBackendMountCmd) -> Result<()> {
+        if self.backend_from_mountpoint(&cmd.mountpoint)?.is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        let backend = fs_backend_factory(&cmd)?;
+        let index = self.get_vfs().mount(backend, &cmd.mountpoint)?;
+        info!("{} filesystem mounted at {}", &cmd.fs_type, &cmd.mountpoint);
+
+        if let Err(e) = self.backend_collection().add(&cmd.mountpoint, &cmd) {
+            warn!(
+                "failed to add filesystem instance to metrics manager, {}",
+                e
+            );
+        }
+        if let Some(mut mgr_guard) = self.upgrade_mgr() {
+            mgr_guard.add_mounts_state(cmd, index);
+            mgr_guard.save_vfs_stat(self.get_vfs())?;
+        }
+
+        Ok(())
+    }
+
+    /// Remount a filesystem instance.
+    fn remount(&self, cmd: FsBackendMountCmd) -> Result<()> {
+        let (rootfs, _) = self
+            .backend_from_mountpoint(&cmd.mountpoint)?
+            .ok_or(Error::NotFound)?;
+        let mut bootstrap = <dyn RafsIoRead>::from_file(&cmd.source)?;
+        let any_fs = rootfs.deref().as_any();
+        let rafs = any_fs
+            .downcast_ref::<Rafs>()
+            .ok_or_else(|| Error::FsTypeMismatch("RAFS".to_string()))?;
+        let rafs_cfg = ConfigV2::from_str(&cmd.config).map_err(RafsError::LoadConfig)?;
+        let rafs_cfg = Arc::new(rafs_cfg);
+
+        rafs.update(&mut bootstrap, &rafs_cfg, &cmd.mountpoint)
+            .map_err(|e| match e {
+                RafsError::Unsupported => Error::Unsupported,
+                e => Error::Rafs(e),
+            })?;
+
+        // To update mounted time and backend configurations.
+        if let Err(e) = self.backend_collection().add(&cmd.mountpoint, &cmd) {
+            warn!(
+                "failed to update filesystem instance to metrics manager, {}",
+                e
+            );
+        }
+        // Update mounts opaque from UpgradeManager
+        if let Some(mut mgr_guard) = self.upgrade_mgr() {
+            mgr_guard.update_mounts_state(cmd)?;
+        }
+
+        Ok(())
+    }
+
+    /// Restore a filesystem instance.
+    fn restore_mount(&self, cmd: &FsBackendMountCmd, vfs_index: u8) -> Result<()> {
+        let backend = fs_backend_factory(cmd)?;
+        self.get_vfs()
+            .restore_mount(backend, vfs_index, &cmd.mountpoint)
+            .map_err(VfsError::RestoreMount)?;
+        self.backend_collection().add(&cmd.mountpoint, cmd)?;
+        info!("backend fs restored at {}", cmd.mountpoint);
+        Ok(())
+    }
+
+    /// Umount a filesystem instance.
+    fn umount(&self, cmd: FsBackendUmountCmd) -> Result<()> {
+        let (fs, fs_idx) = self
+            .backend_from_mountpoint(&cmd.mountpoint)?
+            .ok_or(Error::NotFound)?;
+
+        if self.is_fuse() {
+            if let Some(rafs) = fs.deref().as_any().downcast_ref::<Rafs>() {
+                let root_ino = rafs.get_root_inode().unwrap();
+                let (mountpoint_parent_ino, mountpoint_name) =
+                    mountpoint_invalidation_target(self.get_vfs(), &cmd.mountpoint)?;
+                self.walk_and_notify_invalidation(
+                    mountpoint_parent_ino,
+                    mountpoint_name,
+                    root_ino,
+                    fs_idx,
+                )?;
+            }
+        }
+
+        drop(fs);
+
+        self.get_vfs().umount(&cmd.mountpoint)?;
+        self.backend_collection().del(&cmd.mountpoint);
+        if let Some(mut mgr_guard) = self.upgrade_mgr() {
+            // Remove mount opaque from UpgradeManager
+            mgr_guard.remove_mounts_state(cmd);
+            mgr_guard.save_vfs_stat(self.get_vfs())?;
+        }
+
+        debug!("try to gc unused blobs");
+        BLOB_FACTORY.gc(None);
+
+        Ok(())
+    }
+
+    /// Get list of metrics information objects about mounted filesystem instances.
+    fn backend_collection(&self) -> MutexGuard<'_, FsBackendCollection>;
+
+    /// Export information about the filesystem service.
+    fn export_backend_info(&self, mountpoint: &str) -> Result<String> {
+        let (fs, _) = self
+            .backend_from_mountpoint(mountpoint)?
+            .ok_or(Error::NotFound)?;
+        let any_fs = fs.deref().as_any();
+        let rafs = any_fs
+            .downcast_ref::<Rafs>()
+            .ok_or_else(|| Error::FsTypeMismatch("RAFS".to_string()))?;
+        let resp = serde_json::to_string(rafs.metadata()).map_err(Error::Serde)?;
+        Ok(resp)
+    }
+
+    /// Export metrics about in-flight operations.
+    fn export_inflight_ops(&self) -> Result<Option<String>>;
+
+    /// Recursively walk the inode tree and send cache invalidation notifications.
+    fn walk_and_notify_invalidation(
+        &self,
+        _parent_kernel_ino: u64,
+        _cur_name: &str,
+        _cur_inode: Arc<dyn RafsInode>,
+        _fs_idx: u8,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check whether the filesystem service is a FUSE service.
+    fn is_fuse(&self) -> bool {
+        false
+    }
+    /// Cast `self` to trait object of [Any] to support object downcast.
+    fn as_any(&self) -> &dyn Any;
+}
+
+fn mountpoint_invalidation_target<'a>(vfs: &Vfs, mountpoint: &'a str) -> Result<(u64, &'a str)> {
+    if mountpoint == "/" {
+        // Keep root mountpoint invalidation compatible with the previous behavior.
+        // Path::file_name() does not produce a basename for "/".
+        return Ok((ROOT_ID, mountpoint.trim_start_matches('/')));
+    }
+
+    let name = Path::new(mountpoint)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Error::InvalidArguments(format!("invalid mountpoint basename {mountpoint}"))
+        })?;
+    let root_pseudofs = vfs.get_root_pseudofs();
+    let mountpoint_ino = root_pseudofs.path_walk(mountpoint)?;
+    let ino = mountpoint_ino.ok_or(Error::NotFound)?;
+    let parent_ino = root_pseudofs.get_parent_inode(ino).ok_or(Error::NotFound)?;
+
+    Ok((parent_ino, name))
+}
+
+/// Validate prefetch file list from user input.
+///
+/// Validation rules:
+/// - an item may be file or directory.
+/// - items must be separated by space, such as "<path1> <path2> <path3>".
+/// - each item must be absolute path, such as "/foo1/bar1 /foo2/bar2".
+fn validate_prefetch_file_list(input: &Option<Vec<String>>) -> Result<Option<Vec<PathBuf>>> {
+    if let Some(list) = input {
+        let list: Vec<PathBuf> = list.iter().map(PathBuf::from).collect();
+        for elem in list.iter() {
+            if !elem.is_absolute() {
+                return Err(Error::InvalidPrefetchList);
+            }
+        }
+        Ok(Some(list))
+    } else {
+        Ok(None)
+    }
+}
+
+fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
+    let prefetch_files = validate_prefetch_file_list(&cmd.prefetch_files)?;
+
+    match cmd.fs_type {
+        FsBackendType::Rafs => {
+            let config = ConfigV2::from_str(cmd.config.as_str()).map_err(RafsError::LoadConfig)?;
+            let config = Arc::new(config);
+            let (mut rafs, reader) = Rafs::new(&config, &cmd.mountpoint, Path::new(&cmd.source))?;
+            rafs.import(reader, prefetch_files)?;
+
+            // Put a writable upper layer above the rafs to create an OverlayFS with two layers.
+            match &config.overlay {
+                Some(ovl_conf) => {
+                    // check workdir and upperdir params.
+                    if ovl_conf.work_dir.is_empty() || ovl_conf.upper_dir.is_empty() {
+                        return Err(Error::InvalidArguments(String::from(
+                            "workdir and upperdir must be specified for overlayfs",
+                        )));
+                    }
+
+                    // Create an overlay upper layer with passthroughfs.
+                    #[cfg(target_os = "macos")]
+                    return Err(Error::InvalidArguments(String::from(
+                        "not support OverlayFs since passthroughfs isn't supported on MacOS",
+                    )));
+                    #[cfg(target_os = "linux")]
+                    {
+                        let fs_cfg = passthrough_config {
+                            // Use upper_dir as root_dir as rw layer.
+                            root_dir: ovl_conf.upper_dir.clone(),
+                            do_import: true,
+                            writeback: true,
+                            no_open: true,
+                            no_opendir: true,
+                            xattr: true,
+                            cache_policy: CachePolicy::Always,
+                            ..Default::default()
+                        };
+                        let fsopts = FsOptions::WRITEBACK_CACHE
+                            | FsOptions::ZERO_MESSAGE_OPEN
+                            | FsOptions::ZERO_MESSAGE_OPENDIR;
+
+                        let passthrough_fs = PassthroughFs::<()>::new(fs_cfg)
+                            .map_err(|e| Error::InvalidConfig(format!("{}", e)))?;
+                        passthrough_fs.init(fsopts).map_err(Error::PassthroughFs)?;
+
+                        type BoxedLayer = Box<dyn Layer<Inode = u64, Handle = u64> + Send + Sync>;
+                        let upper_layer = Arc::new(Box::new(passthrough_fs) as BoxedLayer);
+
+                        // Create overlay lower layer with rafs, use lower_dir as root_dir of rafs.
+                        let lower_layers = vec![Arc::new(Box::new(rafs) as BoxedLayer)];
+
+                        let overlay_config = overlay_config {
+                            work: ovl_conf.work_dir.clone(),
+                            mountpoint: cmd.mountpoint.clone(),
+                            do_import: false,
+                            no_open: true,
+                            no_opendir: true,
+                            ..Default::default()
+                        };
+                        let overlayfs =
+                            OverlayFs::new(Some(upper_layer), lower_layers, overlay_config)
+                                .map_err(|e| Error::InvalidConfig(format!("{}", e)))?;
+                        info!(
+                            "init overlay fs inode, upper {}, work {}\n",
+                            ovl_conf.upper_dir.clone(),
+                            ovl_conf.work_dir.clone()
+                        );
+                        overlayfs
+                            .import()
+                            .map_err(|e| Error::InvalidConfig(format!("{}", e)))?;
+                        info!("Overlay filesystem imported");
+                        Ok(Box::new(overlayfs))
+                    }
+                }
+                None => {
+                    info!("RAFS filesystem imported");
+                    Ok(Box::new(rafs))
+                }
+            }
+        }
+        FsBackendType::PassthroughFs => {
+            #[cfg(target_os = "macos")]
+            return Err(Error::InvalidArguments(String::from(
+                "not support passthroughfs",
+            )));
+            #[cfg(target_os = "linux")]
+            {
+                // Vfs by default enables no_open and writeback, passthroughfs
+                // needs to specify them explicitly.
+                // TODO(liubo): enable no_open_dir.
+                let fs_cfg = passthrough_config {
+                    root_dir: cmd.source.to_string(),
+                    do_import: false,
+                    writeback: true,
+                    no_open: true,
+                    xattr: true,
+                    ..Default::default()
+                };
+                let passthrough_fs =
+                    PassthroughFs::<()>::new(fs_cfg).map_err(Error::PassthroughFs)?;
+                passthrough_fs.import().map_err(Error::PassthroughFs)?;
+                info!("PassthroughFs imported");
+                Ok(Box::new(passthrough_fs))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_should_add_new_backend() {
+        let mut col: FsBackendCollection = Default::default();
+        let config = r#"{
+                "version": 2,
+                "id": "factory1",
+                "backend": {
+                    "type": "localfs",
+                    "localfs": {
+                        "dir": "/tmp/nydus"
+                    }
+                },
+                "cache": {
+                    "type": "fscache",
+                    "fscache": {
+                        "work_dir": "/tmp/nydus"
+                    }
+                },
+                "metadata_path": "/tmp/nydus/bootstrap1"
+            }"#;
+        let r = col.add(
+            "test",
+            &FsBackendMountCmd {
+                fs_type: FsBackendType::Rafs,
+                config: config.to_string(),
+                mountpoint: "testmonutount".to_string(),
+                source: "testsource".to_string(),
+                prefetch_files: Some(vec!["testfile".to_string()]),
+            },
+        );
+        assert!(r.is_ok(), "failed to add backend collection");
+
+        assert_eq!(col.0.len(), 1);
+
+        col.del("test");
+        assert_eq!(col.0.len(), 0);
+    }
+
+    #[test]
+    fn it_should_verify_prefetch_files() {
+        let files = validate_prefetch_file_list(&Some(vec!["/etc/passwd".to_string()]));
+        assert!(files.is_ok(), "failed to verify prefetch files");
+        assert_eq!(1, files.unwrap().unwrap().len());
+
+        let files = validate_prefetch_file_list(&None).unwrap();
+        assert!(files.is_none());
+
+        assert!(
+            validate_prefetch_file_list(&Some(vec!["etc/passwd".to_string()])).is_err(),
+            "should not pass verify"
+        );
+
+        assert!(validate_prefetch_file_list(&Some(vec![
+            "/etc/passwd".to_string(),
+            "relative/path".to_string(),
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn it_should_resolve_root_mountpoint_invalidation_target() {
+        let vfs = Vfs::default();
+        let (parent_ino, name) = mountpoint_invalidation_target(&vfs, "/").unwrap();
+
+        assert_eq!(parent_ino, ROOT_ID);
+        assert_eq!(name, "");
+    }
+
+    #[test]
+    fn it_should_resolve_nested_mountpoint_invalidation_target() {
+        let vfs = Vfs::default();
+        let root_pseudofs = vfs.get_root_pseudofs();
+        root_pseudofs.mount("/a/b/c").unwrap();
+
+        let (parent_ino, name) = mountpoint_invalidation_target(&vfs, "/a/b/c").unwrap();
+        let expected_parent_ino = root_pseudofs.path_walk("/a/b").unwrap().unwrap();
+
+        assert_eq!(parent_ino, expected_parent_ino);
+        assert_eq!(name, "c");
+    }
+
+    #[test]
+    fn it_should_fail_to_resolve_missing_mountpoint_invalidation_target() {
+        let vfs = Vfs::default();
+
+        let err = mountpoint_invalidation_target(&vfs, "/a/b/c").unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&err),
+            std::mem::discriminant(&Error::NotFound)
+        );
+    }
+
+    #[test]
+    fn it_should_fail_to_resolve_relative_mountpoint_invalidation_target() {
+        let vfs = Vfs::default();
+
+        assert!(mountpoint_invalidation_target(&vfs, "a/b/c").is_err());
+    }
+
+    #[test]
+    fn it_should_reject_invalid_mountpoint_invalidation_basename() {
+        let vfs = Vfs::default();
+
+        let err = mountpoint_invalidation_target(&vfs, "/..").unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&err),
+            std::mem::discriminant(&Error::InvalidArguments(String::new()))
+        );
+    }
+
+    #[test]
+    fn it_should_add_passthrough_backend_and_override() {
+        let mut col: FsBackendCollection = Default::default();
+        let cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::PassthroughFs,
+            config: String::new(),
+            mountpoint: "/tmp/mount".to_string(),
+            source: "/tmp/source".to_string(),
+            prefetch_files: None,
+        };
+        assert!(col.add("test", &cmd).is_ok());
+        assert_eq!(col.0.len(), 1);
+        assert!(col.0.get("test").unwrap().config.is_none());
+
+        assert!(col.add("test", &cmd).is_ok());
+        assert_eq!(col.0.len(), 1);
+
+        col.del("missing");
+        assert_eq!(col.0.len(), 1);
+    }
+
+    #[test]
+    fn it_should_create_rafs_backend() {
+        let config = r#"
+        {
+            "device": {
+              "backend": {
+                "type": "oss",
+                "config": {
+                  "endpoint": "test",
+                  "access_key_id": "test",
+                  "access_key_secret": "test",
+                  "bucket_name": "antsys-nydus",
+                  "object_prefix":"nydus_v2/",
+                  "scheme": "http"
+                }
+              }
+            },
+            "mode": "direct",
+            "digest_validate": false,
+            "enable_xattr": true,
+            "fs_prefetch": {
+              "enable": true,
+              "threads_count": 10,
+              "merging_size": 131072,
+              "bandwidth_rate": 10485760
+            }
+          }"#;
+        let bootstrap = "../tests/texture/bootstrap/nydusd_daemon_test_bootstrap";
+        if fs_backend_factory(&FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            config: config.to_string(),
+            mountpoint: "testmountpoint".to_string(),
+            source: bootstrap.to_string(),
+            prefetch_files: Some(vec!["/testfile".to_string()]),
+        })
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Rafs>()
+        .is_none()
+        {
+            panic!("failed to create rafs backend")
+        }
+    }
+}

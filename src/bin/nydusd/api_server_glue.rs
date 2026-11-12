@@ -1,81 +1,73 @@
 // Copyright 2020 Ant Group. All rights reserved.
-// Copyright (C) 2020 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2020-2022 Alibaba Cloud. All rights reserved.
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-use std::convert::From;
-use std::str::FromStr;
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+#![allow(clippy::result_large_err)]
 
-use event_manager::{EventOps, EventSubscriber, Events};
+use std::io::Result;
+use std::str::FromStr;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use mio::Waker;
 use nix::sys::signal::{kill, SIGTERM};
 use nix::unistd::Pid;
-use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
-use nydus_api::http_endpoint::{
-    ApiError, ApiMountCmd, ApiRequest, ApiResponse, ApiResponsePayload, ApiResult, DaemonConf,
-    DaemonErrorKind, MetricsErrorKind,
+use nydus::daemon::NydusDaemon;
+use nydus::{FsBackendMountCmd, FsBackendType, FsBackendUmountCmd, FsService};
+use nydus_api::{
+    start_http_thread, ApiError, ApiMountCmd, ApiRequest, ApiResponse, ApiResponsePayload,
+    ApiResult, BlobCacheEntry, BlobCacheObjectId, Config, DaemonConf, DaemonErrorKind,
+    MetricsErrorKind,
 };
 use nydus_utils::metrics;
 
-use crate::daemon::{
-    DaemonError, FsBackendMountCmd, FsBackendType, FsBackendUmountCmd, NydusDaemon,
-};
-#[cfg(fusedev)]
-use crate::fusedev::FusedevDaemon;
+use crate::DAEMON_CONTROLLER;
 
-pub struct ApiServer {
+struct ApiServer {
     to_http: Sender<ApiResponse>,
-    daemon: Arc<dyn NydusDaemon>,
-}
-
-type Result<T> = ApiResult<T>;
-
-impl From<DaemonError> for DaemonErrorKind {
-    fn from(e: DaemonError) -> Self {
-        use DaemonError::*;
-        match e {
-            UpgradeManager(_) => DaemonErrorKind::UpgradeManager,
-            NotReady => DaemonErrorKind::NotReady,
-            Unsupported => DaemonErrorKind::Unsupported,
-            Serde(e) => DaemonErrorKind::Serde(e),
-            UnexpectedEvent(e) => DaemonErrorKind::UnexpectedEvent(format!("{:?}", e)),
-            o => DaemonErrorKind::Other(o.to_string()),
-        }
-    }
 }
 
 impl ApiServer {
-    pub fn new(
-        to_http: Sender<ApiResponse>,
-        daemon: Arc<dyn NydusDaemon>,
-    ) -> std::io::Result<Self> {
-        Ok(ApiServer { to_http, daemon })
+    fn new(to_http: Sender<ApiResponse>) -> Result<Self> {
+        Ok(ApiServer { to_http })
     }
 
-    fn process_request(&self, from_http: &Receiver<ApiRequest>) -> std::io::Result<()> {
-        let request = from_http
-            .recv()
-            .map_err(|e| epipe!(format!("receive API channel failed {}", e)))?;
-
+    fn process_request(&self, request: ApiRequest) -> Result<()> {
         let resp = match request {
-            ApiRequest::DaemonInfo => self.daemon_info(),
-            ApiRequest::Events => Self::events(),
-            ApiRequest::Mount((mountpoint, info)) => self.do_mount(mountpoint, info),
-            ApiRequest::Remount((mountpoint, info)) => self.do_remount(mountpoint, info),
-            ApiRequest::Umount(mountpoint) => self.do_umount(mountpoint),
+            // Common (v1/v2)
             ApiRequest::ConfigureDaemon(conf) => self.configure_daemon(conf),
-            ApiRequest::ExportGlobalMetrics(id) => Self::export_global_metrics(id),
-            ApiRequest::ExportFilesMetrics(id) => Self::export_files_metrics(id),
-            ApiRequest::ExportAccessPatterns(id) => Self::export_access_patterns(id),
+            ApiRequest::GetDaemonInfo => self.daemon_info(true),
+            ApiRequest::GetEvents => Self::events(),
+            ApiRequest::Exit => self.do_exit(),
+            ApiRequest::Start => self.do_start(),
+            ApiRequest::SendFuseFd => self.send_fuse_fd(),
+            ApiRequest::TakeoverFuseFd => self.do_takeover(),
+            ApiRequest::Mount(mountpoint, info) => self.do_mount(mountpoint, info),
+            ApiRequest::Remount(mountpoint, info) => self.do_remount(mountpoint, info),
+            ApiRequest::Umount(mountpoint) => self.do_umount(mountpoint),
             ApiRequest::ExportBackendMetrics(id) => Self::export_backend_metrics(id),
             ApiRequest::ExportBlobcacheMetrics(id) => Self::export_blobcache_metrics(id),
-            ApiRequest::ExportInflightMetrics => self.export_inflight_metrics(),
+
+            // Nydus API v1
+            ApiRequest::ExportFsGlobalMetrics(id) => Self::export_global_metrics(id),
+            ApiRequest::ExportFsFilesMetrics(id, latest_read_files) => {
+                Self::export_files_metrics(id, latest_read_files)
+            }
+            ApiRequest::ExportFsAccessPatterns(id) => Self::export_access_patterns(id),
             ApiRequest::ExportFsBackendInfo(mountpoint) => self.backend_info(&mountpoint),
-            ApiRequest::SendFuseFd => self.send_fuse_fd(),
-            ApiRequest::Takeover => self.do_takeover(),
-            ApiRequest::Exit => self.do_exit(),
+            ApiRequest::ExportFsInflightMetrics => self.export_inflight_metrics(),
+            ApiRequest::GetConfig(id) => self.get_config(id),
+            ApiRequest::UpdateConfig(id, config) => self.update_config(id, config),
+
+            // Nydus API v2
+            ApiRequest::GetDaemonInfoV2 => self.daemon_info(false),
+            ApiRequest::GetBlobObject(_param) => todo!(),
+            ApiRequest::CreateBlobObject(entry) => self.create_blob_cache_entry(&entry),
+            ApiRequest::DeleteBlobObject(param) => self.remove_blob_cache_entry(&param),
+            ApiRequest::DeleteBlobFile(blob_id) => self.blob_cache_gc(blob_id),
         };
 
         self.respond(resp);
@@ -83,31 +75,10 @@ impl ApiServer {
         Ok(())
     }
 
-    fn respond(&self, resp: Result<ApiResponsePayload>) {
+    fn respond(&self, resp: ApiResult<ApiResponsePayload>) {
         if let Err(e) = self.to_http.send(resp) {
             error!("send API response failed {}", e);
         }
-    }
-
-    fn daemon_info(&self) -> ApiResponse {
-        let d = self.daemon.as_ref();
-        let info = d
-            .export_info()
-            .map_err(|e| ApiError::Metrics(MetricsErrorKind::Daemon(e.into())))?;
-        Ok(ApiResponsePayload::DaemonInfo(info))
-    }
-
-    fn events() -> ApiResponse {
-        let events = metrics::export_events().map_err(|e| ApiError::Events(format!("{:?}", e)))?;
-        Ok(ApiResponsePayload::Events(events))
-    }
-
-    fn backend_info(&self, mountpoint: &str) -> ApiResponse {
-        let d = self.daemon.as_ref();
-        let info = d
-            .export_backend_info(mountpoint)
-            .map_err(|e| ApiError::Metrics(MetricsErrorKind::Daemon(e.into())))?;
-        Ok(ApiResponsePayload::FsBackendInfo(info))
     }
 
     fn configure_daemon(&self, conf: DaemonConf) -> ApiResponse {
@@ -123,15 +94,61 @@ impl ApiServer {
             })
     }
 
+    fn daemon_info(&self, include_fs_info: bool) -> ApiResponse {
+        self.get_daemon_object()?
+            .export_info(include_fs_info)
+            .map_err(|e| ApiError::Metrics(MetricsErrorKind::Daemon(e.into())))
+            .map(ApiResponsePayload::DaemonInfo)
+    }
+
+    /// External supervisor wants this instance to exit. But it can't just die leave
+    /// some pending or in-flight fuse messages un-handled. So this method guarantees
+    /// all fuse messages read from kernel are handled and replies are sent back.
+    /// Before http response are sent back, this must can ensure that current process
+    /// has absolutely stopped. Otherwise, multiple processes might read from single
+    /// fuse session simultaneously.
+    fn do_exit(&self) -> ApiResponse {
+        let d = self.get_daemon_object()?;
+        d.trigger_exit()
+            .map(|_| {
+                info!("exit daemon by http request");
+                ApiResponsePayload::Empty
+            })
+            .map_err(|e| ApiError::DaemonAbnormal(e.into()))?;
+
+        // Should be reliable since this Api server works under event manager.
+        kill(Pid::this(), SIGTERM).unwrap_or_else(|e| error!("Send signal error. {}", e));
+
+        Ok(ApiResponsePayload::Empty)
+    }
+
+    /// External supervisor wants this instance to fetch `/dev/fuse` fd. Before
+    /// invoking this method, supervisor should already listen on a Unix socket and
+    /// waits for connection from this instance. Then supervisor should send the *fd*
+    /// back. Note, the http response does not mean this process already finishes Takeover
+    /// procedure. Supervisor has to continuously query the state of Nydusd until it gets
+    /// to *RUNNING*, which means new Nydusd has successfully served as a fuse server.
+    fn do_takeover(&self) -> ApiResponse {
+        let d = self.get_daemon_object()?;
+        d.trigger_takeover()
+            .map(|_| ApiResponsePayload::Empty)
+            .map_err(|e| ApiError::DaemonAbnormal(e.into()))
+    }
+
+    fn events() -> ApiResponse {
+        let events = metrics::export_events().map_err(|e| ApiError::Events(format!("{:?}", e)))?;
+        Ok(ApiResponsePayload::Events(events))
+    }
+
     fn export_global_metrics(id: Option<String>) -> ApiResponse {
         metrics::export_global_stats(&id)
             .map(ApiResponsePayload::FsGlobalMetrics)
             .map_err(|e| ApiError::Metrics(MetricsErrorKind::Stats(e)))
     }
 
-    fn export_files_metrics(id: Option<String>) -> ApiResponse {
+    fn export_files_metrics(id: Option<String>, latest_read_files: bool) -> ApiResponse {
         // TODO: Use mount point name to refer to per rafs metrics.
-        metrics::export_files_stats(&id)
+        metrics::export_files_stats(&id, latest_read_files)
             .map(ApiResponsePayload::FsFilesMetrics)
             .map_err(|e| ApiError::Metrics(MetricsErrorKind::Stats(e)))
     }
@@ -152,6 +169,19 @@ impl ApiServer {
         metrics::export_blobcache_metrics(&id)
             .map(ApiResponsePayload::BlobcacheMetrics)
             .map_err(|e| ApiError::Metrics(MetricsErrorKind::Stats(e)))
+    }
+
+    #[inline]
+    fn get_daemon_object(&self) -> std::result::Result<Arc<dyn NydusDaemon>, ApiError> {
+        Ok(DAEMON_CONTROLLER.get_daemon())
+    }
+
+    fn backend_info(&self, mountpoint: &str) -> ApiResponse {
+        let info = self
+            .get_default_fs_service()?
+            .export_backend_info(mountpoint)
+            .map_err(|e| ApiError::Metrics(MetricsErrorKind::Daemon(e.into())))?;
+        Ok(ApiResponsePayload::FsBackendInfo(info))
     }
 
     /// Detect if there is fop being hang.
@@ -182,78 +212,36 @@ impl ApiServer {
     /// It means 3 threads are processing inflight requests.
     fn export_inflight_metrics(&self) -> ApiResponse {
         // TODO: Implement automatic error conversion between DaemonError and ApiError.
-        let d = self.daemon.as_ref();
-        if let Some(ops) = d
+        let fs = self.get_default_fs_service()?;
+        if let Some(ops) = fs
             .export_inflight_ops()
             .map_err(|e| ApiError::Metrics(MetricsErrorKind::Daemon(e.into())))?
         {
-            Ok(ApiResponsePayload::InflightMetrics(ops))
+            Ok(ApiResponsePayload::FsInflightMetrics(ops))
         } else {
             Ok(ApiResponsePayload::Empty)
         }
     }
 
-    fn send_fuse_fd(&self) -> ApiResponse {
-        let d = self.daemon.as_ref();
-
-        d.save()
-            .map(|_| ApiResponsePayload::Empty)
-            .map_err(|e| ApiError::DaemonAbnormal(e.into()))
-    }
-
-    /// External supervisor wants this instance to fetch `/dev/fuse` fd. Before
-    /// invoking this method, supervisor should already listens on a Unix socket and
-    /// waits for connection from this instance. Then supervisor should send the *fd*
-    /// back. Note, the http response does not mean this process already finish Takeover
-    /// procedure. Supervisor has to continuously query the state of Nydusd until it gets
-    /// to *RUNNING*, which means new Nydusd has successfully serve as a fuse server.
-    fn do_takeover(&self) -> ApiResponse {
-        let d = self.daemon.as_ref();
-        d.trigger_takeover()
-            .map(|_| ApiResponsePayload::Empty)
-            .map_err(|e| ApiError::DaemonAbnormal(e.into()))
-    }
-
-    /// External supervisor wants this instance to exit. But it can't just die leave
-    /// some pending or in-flight fuse messages un-handled. So this method guarantees
-    /// all fuse messages read from kernel are handled and replies are sent back.
-    /// Before http response are sent back, this must can ensure that current process
-    /// has absolutely stopped. Otherwise, multiple processes might read from single
-    /// fuse session simultaneously.
-    fn do_exit(&self) -> ApiResponse {
-        let d = self.daemon.as_ref();
-        d.trigger_exit()
-            .map(|_| {
-                info!("exit daemon by http request");
-                ApiResponsePayload::Empty
-            })
-            .map_err(|e| ApiError::DaemonAbnormal(e.into()))?;
-
-        // Should be reliable since this Api server works under event manager.
-        kill(Pid::this(), SIGTERM).unwrap_or_else(|e| error!("Send signal error. {}", e));
-
-        Ok(ApiResponsePayload::Empty)
-    }
-
     fn do_mount(&self, mountpoint: String, cmd: ApiMountCmd) -> ApiResponse {
-        let fs_type =
-            FsBackendType::from_str(&cmd.fs_type).map_err(|e| ApiError::MountFailure(e.into()))?;
-        self.daemon
-            .mount(FsBackendMountCmd {
-                fs_type,
-                mountpoint,
-                config: cmd.config,
-                source: cmd.source,
-                prefetch_files: cmd.prefetch_files,
-            })
-            .map(|_| ApiResponsePayload::Empty)
-            .map_err(|e| ApiError::MountFailure(e.into()))
+        let fs_type = FsBackendType::from_str(&cmd.fs_type)
+            .map_err(|e| ApiError::MountFilesystem(e.into()))?;
+        let fs = self.get_default_fs_service()?;
+        fs.mount(FsBackendMountCmd {
+            fs_type,
+            mountpoint,
+            config: cmd.config,
+            source: cmd.source,
+            prefetch_files: cmd.prefetch_files,
+        })
+        .map(|_| ApiResponsePayload::Empty)
+        .map_err(|e| ApiError::MountFilesystem(e.into()))
     }
 
     fn do_remount(&self, mountpoint: String, cmd: ApiMountCmd) -> ApiResponse {
-        let fs_type =
-            FsBackendType::from_str(&cmd.fs_type).map_err(|e| ApiError::MountFailure(e.into()))?;
-        self.daemon
+        let fs_type = FsBackendType::from_str(&cmd.fs_type)
+            .map_err(|e| ApiError::MountFilesystem(e.into()))?;
+        self.get_default_fs_service()?
             .remount(FsBackendMountCmd {
                 fs_type,
                 mountpoint,
@@ -262,70 +250,216 @@ impl ApiServer {
                 prefetch_files: cmd.prefetch_files,
             })
             .map(|_| ApiResponsePayload::Empty)
-            .map_err(|e| ApiError::MountFailure(e.into()))
+            .map_err(|e| ApiError::MountFilesystem(e.into()))
     }
 
     fn do_umount(&self, mountpoint: String) -> ApiResponse {
-        self.daemon
+        self.get_default_fs_service()?
             .umount(FsBackendUmountCmd { mountpoint })
             .map(|_| ApiResponsePayload::Empty)
-            .map_err(|e| ApiError::MountFailure(e.into()))
+            .map_err(|e| ApiError::MountFilesystem(e.into()))
+    }
+
+    fn send_fuse_fd(&self) -> ApiResponse {
+        let d = self.get_daemon_object()?;
+
+        d.save()
+            .map(|_| ApiResponsePayload::Empty)
+            .map_err(|e| ApiError::DaemonAbnormal(e.into()))
+    }
+
+    fn get_default_fs_service(&self) -> std::result::Result<Arc<dyn FsService>, ApiError> {
+        DAEMON_CONTROLLER
+            .get_fs_service()
+            .ok_or(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported))
+    }
+
+    // HTTP API v2
+    fn create_blob_cache_entry(&self, entry: &BlobCacheEntry) -> ApiResponse {
+        match DAEMON_CONTROLLER.get_blob_cache_mgr() {
+            None => Err(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported)),
+            Some(mgr) => {
+                if let Err(e) = mgr.add_blob_entry(entry) {
+                    Err(ApiError::DaemonAbnormal(DaemonErrorKind::Other(format!(
+                        "{}",
+                        e
+                    ))))
+                } else {
+                    if let Some(mut mgr_guard) = self.get_daemon_object()?.upgrade_mgr() {
+                        // if started with supervisor, save the blob entry state
+                        mgr_guard.add_blob_entry_state(entry.clone());
+                    }
+                    Ok(ApiResponsePayload::Empty)
+                }
+            }
+        }
+    }
+
+    fn remove_blob_cache_entry(&self, param: &BlobCacheObjectId) -> ApiResponse {
+        match DAEMON_CONTROLLER.get_blob_cache_mgr() {
+            None => Err(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported)),
+            Some(mgr) => {
+                if let Err(e) = mgr.remove_blob_entry(param) {
+                    Err(ApiError::DaemonAbnormal(DaemonErrorKind::Other(format!(
+                        "{}",
+                        e
+                    ))))
+                } else {
+                    if let Some(mut mgr_guard) = self.get_daemon_object()?.upgrade_mgr() {
+                        mgr_guard.remove_blob_entry_state(&param.domain_id, &param.blob_id);
+                    }
+                    Ok(ApiResponsePayload::Empty)
+                }
+            }
+        }
+    }
+
+    fn blob_cache_gc(&self, blob_id: String) -> ApiResponse {
+        self.get_daemon_object()?
+            .delete_blob(blob_id)
+            .map_err(|e| ApiError::DaemonAbnormal(e.into()))
+            .map(|_| ApiResponsePayload::Empty)
+    }
+
+    fn do_start(&self) -> ApiResponse {
+        let d = self.get_daemon_object()?;
+        d.trigger_start()
+            .map(|_| ApiResponsePayload::Empty)
+            .map_err(|e| ApiError::DaemonAbnormal(e.into()))
+    }
+
+    fn update_config(&self, id: Option<String>, config: Config) -> ApiResponse {
+        use std::convert::TryFrom;
+
+        let use_id = id.as_deref().unwrap_or("");
+        for (key_type, value) in config.iter() {
+            if let Ok(keys) = nydus_utils::config::Keys::try_from(key_type.as_str()) {
+                nydus_utils::config::set(use_id, &keys, value.clone());
+            } else {
+                return Err(ApiError::ResponsePayloadType);
+            }
+        }
+        Ok(ApiResponsePayload::Empty)
+    }
+
+    fn get_config(&self, id: Option<String>) -> ApiResponse {
+        let config_map = nydus_utils::config::get_all(id.as_deref().map(|s| s.to_string()));
+        let config: Config = config_map;
+        Ok(ApiResponsePayload::Config(config))
     }
 }
 
-pub struct ApiSeverSubscriber {
-    event_fd: EventFd,
+struct ApiServerHandler {
     server: ApiServer,
-    api_receiver: Receiver<ApiRequest>,
+    api_receiver: Receiver<Option<ApiRequest>>,
 }
 
-impl ApiSeverSubscriber {
-    pub fn new(server: ApiServer, api_receiver: Receiver<ApiRequest>) -> std::io::Result<Self> {
-        match EventFd::new(0) {
-            Ok(fd) => Ok(Self {
-                event_fd: fd,
-                server,
-                api_receiver,
-            }),
-            Err(e) => {
-                error!("Creating event fd failed. {}", e);
-                Err(e)
+impl ApiServerHandler {
+    fn new(server: ApiServer, api_receiver: Receiver<Option<ApiRequest>>) -> Result<Self> {
+        Ok(Self {
+            server,
+            api_receiver,
+        })
+    }
+
+    fn handle_requests_from_router(&self) {
+        loop {
+            match self.api_receiver.recv() {
+                Ok(request) => {
+                    if let Some(req) = request {
+                        self.server.process_request(req).unwrap_or_else(|e| {
+                            error!("HTTP handler failed to process request, {}", e)
+                        });
+                    } else {
+                        debug!("Received exit notification from the HTTP router");
+                        return;
+                    }
+                }
+                Err(_e) => {
+                    error!("Failed to receive request from the HTTP router");
+                    return;
+                }
             }
         }
     }
-
-    pub fn get_event_fd(&self) -> std::io::Result<EventFd> {
-        self.event_fd.try_clone()
-    }
 }
 
-impl EventSubscriber for ApiSeverSubscriber {
-    fn process(&self, events: Events, event_ops: &mut EventOps) {
-        self.event_fd
-            .read()
-            .map(|_| ())
-            .map_err(|e| last_error!(e))
-            .unwrap_or_else(|_| {});
-        match events.event_set() {
-            EventSet::IN => {
-                self.server
-                    .process_request(&self.api_receiver)
-                    .unwrap_or_else(|e| error!("API server process events failed, {}", e));
-            }
-            EventSet::ERROR => {
-                error!("Got error on the monitored event.");
-            }
-            EventSet::HANG_UP => {
-                event_ops
-                    .remove(events)
-                    .unwrap_or_else(|e| error!("Encountered error during cleanup, {}", e));
-            }
-            _ => {}
+/// HTTP API server to serve the administration socket.
+pub struct ApiServerController {
+    http_handler_thread: Option<JoinHandle<Result<()>>>,
+    http_router_thread: Option<JoinHandle<Result<()>>>,
+    sock: Option<String>,
+    waker: Option<Arc<Waker>>,
+}
+
+impl ApiServerController {
+    /// Create a new instance of `ApiServerController`.
+    pub fn new(sock: Option<&str>) -> Self {
+        ApiServerController {
+            sock: sock.map(|v| v.to_string()),
+            http_handler_thread: None,
+            http_router_thread: None,
+            waker: None,
         }
     }
 
-    fn init(&self, ops: &mut EventOps) {
-        ops.add(Events::new(&self.event_fd, EventSet::IN))
-            .expect("Cannot register event")
+    /// Try to start the HTTP working thread.
+    pub fn start(&mut self) -> Result<()> {
+        if self.sock.is_none() {
+            return Ok(());
+        }
+
+        // Safe to unwrap() because self.sock is valid.
+        let apisock = self.sock.as_ref().unwrap();
+        let (to_handler, from_router) = channel();
+        let (to_router, from_handler) = channel();
+        let api_server = ApiServer::new(to_router)?;
+        let api_handler = ApiServerHandler::new(api_server, from_router)?;
+        let (router_thread, waker) = start_http_thread(apisock, to_handler, from_handler)?;
+        let daemon_waker = DAEMON_CONTROLLER.alloc_waker();
+
+        info!("HTTP API server running at {}", apisock);
+        let handler_thread = std::thread::Builder::new()
+            .name("api-server".to_string())
+            .spawn(move || {
+                api_handler.handle_requests_from_router();
+                info!("HTTP api-server handler thread exits");
+                let _ = daemon_waker.wake();
+                Ok(())
+            })
+            .map_err(|_e| einval!("Failed to start work thread for HTTP handler"))?;
+
+        self.waker = Some(waker);
+        self.http_handler_thread = Some(handler_thread);
+        self.http_router_thread = Some(router_thread);
+
+        Ok(())
+    }
+
+    /// Stop the HTTP working thread.
+    pub fn stop(&mut self) {
+        // Signal the HTTP router thread to exit, which will then notify the HTTP handler thread.
+        if let Some(waker) = self.waker.take() {
+            let _ = waker.wake();
+        }
+        if let Some(t) = self.http_handler_thread.take() {
+            if let Err(e) = t.join() {
+                error!(
+                    "Failed to join the HTTP handler thread, execution error. {:?}",
+                    e
+                );
+            }
+        }
+        if let Some(t) = self.http_router_thread.take() {
+            if let Err(e) = t.join() {
+                error!(
+                    "Failed to join the HTTP router thread, execution error. {:?}",
+                    e
+                );
+            }
+        }
+        if let Some(apisock) = self.sock.as_ref() {
+            std::fs::remove_file(apisock).unwrap_or_default();
+        }
     }
 }

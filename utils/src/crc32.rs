@@ -1,0 +1,306 @@
+// Copyright 2025 Nydus Developers. All rights reserved.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use crc::Crc;
+use crc::Table;
+use nix::sys::uio;
+use std::fmt;
+use std::fmt::Debug;
+use std::io::ErrorKind;
+use std::io::Read;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Algorithm {
+    None = 0,
+    #[default]
+    Crc32Iscsi = 1,
+}
+
+impl fmt::Display for Algorithm {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl TryFrom<u32> for Algorithm {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value == Algorithm::None as u32 {
+            Ok(Algorithm::None)
+        } else if value == Algorithm::Crc32Iscsi as u32 {
+            Ok(Algorithm::Crc32Iscsi)
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl TryFrom<u64> for Algorithm {
+    type Error = ();
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == Algorithm::None as u64 {
+            Ok(Algorithm::None)
+        } else if value == Algorithm::Crc32Iscsi as u64 {
+            Ok(Algorithm::Crc32Iscsi)
+        } else {
+            Err(())
+        }
+    }
+}
+
+pub struct Crc32 {
+    crc: Crc<u32, Table<16>>,
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new(Algorithm::Crc32Iscsi)
+    }
+}
+
+impl Crc32 {
+    pub fn new(algorithm: Algorithm) -> Self {
+        let crc = match algorithm {
+            Algorithm::Crc32Iscsi => &crc::CRC_32_ISCSI,
+            _ => &crc::CRC_32_ISCSI,
+        };
+        Self {
+            crc: Crc::<u32, Table<16>>::new(crc),
+        }
+    }
+
+    pub fn from_buf(&self, bytes: &[u8]) -> u32 {
+        self.crc.checksum(bytes)
+    }
+
+    /// Compute message crc32 by read data from the reader.
+    pub fn from_reader<R: Read>(&self, reader: &mut R) -> std::io::Result<u32> {
+        let mut digester = self.crc.digest();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let sz = reader.read(&mut buf)?;
+            if sz == 0 {
+                return Ok(digester.finalize());
+            }
+            digester.update(&buf[0..sz]);
+        }
+    }
+
+    pub fn digester(&self) -> crc::Digest<'_, u32, Table<16>> {
+        self.crc.digest()
+    }
+
+    pub fn from_raw_fd(&self, fd: i32, offset: u64, size: u64) -> std::io::Result<u32> {
+        let mut digester = self.crc.digest();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut total_read: u64 = 0;
+        loop {
+            if total_read >= size {
+                break;
+            }
+            let bytes_to_read = std::cmp::min((size - total_read) as usize, buf.len());
+            let ret = uio::pread(fd, &mut buf[..bytes_to_read], (offset + total_read) as i64)
+                .map_err(|_| last_error!());
+            match ret {
+                Ok(read_size) => {
+                    if read_size == 0 {
+                        break;
+                    }
+                    digester.update(&buf[..read_size]);
+                    total_read += read_size as u64;
+                }
+                Err(err) => {
+                    if err.kind() != ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(digester.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_os = "linux")]
+    use std::io::Write;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn test_algorithm_display() {
+        assert_eq!(format!("{}", Algorithm::None), "None");
+        assert_eq!(format!("{}", Algorithm::Crc32Iscsi), "Crc32Iscsi");
+    }
+
+    #[test]
+    fn test_algorithm_default() {
+        let algo = Algorithm::default();
+        assert_eq!(algo, Algorithm::Crc32Iscsi);
+    }
+
+    #[test]
+    fn test_algorithm_try_from_u32() {
+        assert_eq!(Algorithm::try_from(0u32), Ok(Algorithm::None));
+        assert_eq!(Algorithm::try_from(1u32), Ok(Algorithm::Crc32Iscsi));
+        assert_eq!(Algorithm::try_from(2u32), Err(()));
+        assert_eq!(Algorithm::try_from(999u32), Err(()));
+    }
+
+    #[test]
+    fn test_algorithm_try_from_u64() {
+        assert_eq!(Algorithm::try_from(0u64), Ok(Algorithm::None));
+        assert_eq!(Algorithm::try_from(1u64), Ok(Algorithm::Crc32Iscsi));
+        assert_eq!(Algorithm::try_from(2u64), Err(()));
+        assert_eq!(Algorithm::try_from(999u64), Err(()));
+    }
+
+    #[test]
+    fn test_crc32_default() {
+        let crc32 = Crc32::default();
+        let data = b"123456789";
+        let expected_checksum = 0xe3069283;
+        assert_eq!(crc32.from_buf(data), expected_checksum);
+    }
+
+    #[test]
+    fn test_crc32_new_with_none_algorithm() {
+        // Algorithm::None falls back to Crc32Iscsi
+        let crc32 = Crc32::new(Algorithm::None);
+        let data = b"123456789";
+        let expected_checksum = 0xe3069283;
+        assert_eq!(crc32.from_buf(data), expected_checksum);
+    }
+
+    #[test]
+    fn test_crc32_from_buf() {
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let data = b"123456789";
+        let expected_checksum = 0xe3069283;
+        let crc32_result = crc32.from_buf(data);
+        assert_eq!(crc32_result, expected_checksum);
+    }
+
+    #[test]
+    fn test_crc32_from_buf_empty() {
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let data = b"";
+        let crc32_result = crc32.from_buf(data);
+        // Empty buffer should have a known CRC32 value
+        assert_eq!(crc32_result, 0);
+    }
+
+    #[test]
+    fn test_crc32_from_reader() {
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let data = b"123456789";
+        let expected_checksum = 0xe3069283;
+        let mut reader = std::io::Cursor::new(data);
+        let crc32_result = crc32.from_reader(&mut reader).unwrap();
+        assert_eq!(crc32_result, expected_checksum);
+    }
+
+    #[test]
+    fn test_crc32_from_reader_empty() {
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let data = b"";
+        let mut reader = std::io::Cursor::new(data);
+        let crc32_result = crc32.from_reader(&mut reader).unwrap();
+        assert_eq!(crc32_result, 0);
+    }
+
+    #[test]
+    fn test_crc32_from_reader_large_data() {
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        // Create data larger than the internal buffer (1MB)
+        let large_data = vec![0x42u8; 2 * 1024 * 1024];
+        let mut reader = std::io::Cursor::new(&large_data);
+        let crc32_result = crc32.from_reader(&mut reader).unwrap();
+        // Verify it matches direct buffer calculation
+        let expected = crc32.from_buf(&large_data);
+        assert_eq!(crc32_result, expected);
+    }
+
+    /// Create an anonymous in-memory file (memfd) with the given content and
+    /// return its raw file descriptor.  The caller is responsible for closing it.
+    #[cfg(target_os = "linux")]
+    fn make_memfd(content: &[u8]) -> i32 {
+        let fd = unsafe { libc::memfd_create(c"crc32_test".as_ptr(), 0) };
+        assert!(fd >= 0, "memfd_create failed");
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(content).unwrap();
+        // Leak the File wrapper so the fd stays open
+        std::mem::forget(file);
+        fd
+    }
+
+    #[test]
+    fn test_crc32_digester() {
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let data = b"hello nydus world";
+
+        // Incremental update via digester() must match a single from_buf() call.
+        let mut digester = crc32.digester();
+        digester.update(&data[..5]);
+        digester.update(&data[5..]);
+        let incremental = digester.finalize();
+
+        assert_eq!(incremental, crc32.from_buf(data));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_crc32_from_raw_fd() {
+        let content = b"hello nydus world";
+        let fd = make_memfd(content);
+
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let result = crc32
+            .from_raw_fd(fd, 0, content.len() as u64)
+            .expect("from_raw_fd failed");
+
+        assert_eq!(result, crc32.from_buf(content));
+
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_crc32_from_raw_fd_with_offset() {
+        let content = b"prefixdata";
+        let offset = 6u64; // skip "prefix", checksum "data"
+        let fd = make_memfd(content);
+
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let result = crc32
+            .from_raw_fd(fd, offset, (content.len() as u64) - offset)
+            .expect("from_raw_fd with offset failed");
+
+        assert_eq!(result, crc32.from_buf(&content[offset as usize..]));
+
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_crc32_from_raw_fd_zero_size() {
+        let content = b"some content";
+        let fd = make_memfd(content);
+
+        let crc32 = Crc32::new(Algorithm::Crc32Iscsi);
+        let result = crc32
+            .from_raw_fd(fd, 0, 0)
+            .expect("from_raw_fd zero size failed");
+
+        // CRC of zero bytes must equal CRC of an empty slice.
+        assert_eq!(result, crc32.from_buf(b""));
+
+        unsafe { libc::close(fd) };
+    }
+}

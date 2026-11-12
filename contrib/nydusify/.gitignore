@@ -2,4 +2,5 @@
 tmp
 cmd/nydusify
 output
-nydusify-smoke
+nydus-hook-plugin
+coverage.txt

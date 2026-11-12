@@ -12,9 +12,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/containerd/archive"
-	"github.com/containerd/containerd/archive/compression"
+	"github.com/containerd/containerd/v2/pkg/archive"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sys/unix"
 )
 
 // PackTargz makes .tar(.gz) stream of file named `name` and return reader
@@ -129,25 +130,40 @@ func PackTargzInfo(src, name string, compress bool) (digest.Digest, int64, error
 }
 
 // UnpackTargz unpacks .tar(.gz) stream, and write to dst path
-func UnpackTargz(ctx context.Context, dst string, r io.Reader) error {
+func UnpackTargz(ctx context.Context, dst string, r io.Reader, overlay bool) error {
 	ds, err := compression.DecompressStream(r)
 	if err != nil {
 		return err
 	}
 	defer ds.Close()
 
-	if err := os.MkdirAll(dst, 0770); err != nil {
+	// Guarantee that umask won't affect file/directory creation
+	mask := unix.Umask(0)
+	defer unix.Umask(mask)
+
+	if err := os.MkdirAll(dst, 0755); err != nil {
 		return err
 	}
 
-	if _, err := archive.Apply(
-		ctx,
-		dst,
-		ds,
-		archive.WithConvertWhiteout(func(hdr *tar.Header, file string) (bool, error) {
-			return true, nil
-		}),
-	); err != nil {
+	if overlay {
+		_, err = archive.Apply(
+			ctx,
+			dst,
+			ds,
+			archive.WithConvertWhiteout(archive.OverlayConvertWhiteout),
+		)
+	} else {
+		_, err = archive.Apply(
+			ctx,
+			dst,
+			ds,
+			archive.WithConvertWhiteout(func(_ *tar.Header, _ string) (bool, error) {
+				return true, nil
+			}),
+		)
+	}
+
+	if err != nil {
 		return err
 	}
 

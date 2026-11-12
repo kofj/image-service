@@ -1,132 +1,609 @@
 // Copyright 2020 Ant Group. All rights reserved.
+// Copyright (C) 2021 Alibaba Cloud. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
+//! A dummy implementation of the [BlobCacheMgr](trait.BlobCacheMgr.html) trait.
+//!
+//! The [DummyCacheMgr](struct.DummyCacheMgr.html) is a dummy implementation of the
+//! [BlobCacheMgr](../trait.BlobCacheMgr.html) trait, which doesn't really cache any data.
+//! Instead it just reads data from the backend, uncompressed it if needed and then pass on
+//! the data to the clients.
+//!
+//! There are two possible usage mode of the [DummyCacheMgr]:
+//! - Read compressed/uncompressed data from remote Registry/OSS backend but not cache the
+//!   uncompressed data on local storage. The
+//!   [is_chunk_cached()](../trait.BlobCache.html#tymethod.is_chunk_cached)
+//!   method always return false to disable data prefetching.
+//! - Read uncompressed data from local disk and no need to double cache the data.
+//!   The [is_chunk_cached()](../trait.BlobCache.html#tymethod.is_chunk_cached) method always
+//!   return true to enable data prefetching.
 use std::io::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use vm_memory::VolatileSlice;
+use fuse_backend_rs::file_buf::FileVolatileSlice;
+use nydus_api::CacheConfigV2;
+use nydus_utils::crypt::{Algorithm, Cipher, CipherContext};
+use nydus_utils::{compress, digest};
 
-use crate::backend::BlobBackend;
-use crate::cache::*;
-use crate::device::{BlobPrefetchControl, RafsBio, RafsChunkInfo};
-use crate::factory::CacheConfig;
-use crate::utils::{alloc_buf, copyv};
-use crate::{compress, StorageError, StorageResult};
+use crate::backend::{BlobBackend, BlobReader};
+use crate::cache::state::{ChunkMap, NoopChunkMap};
+use crate::cache::{BlobCache, BlobCacheMgr};
+use crate::device::{
+    BlobChunkInfo, BlobFeatures, BlobInfo, BlobIoDesc, BlobIoVec, BlobPrefetchRequest,
+};
+use crate::utils::{alloc_buf, copyv, AlignedBuf};
+use crate::{StorageError, StorageResult};
 
-use nydus_utils::{digest, eother};
-
-pub struct DummyCache {
-    pub backend: Arc<dyn BlobBackend + Sync + Send>,
-    validate: bool,
+struct DummyCache {
+    blob_id: String,
+    blob_info: Arc<BlobInfo>,
+    chunk_map: Arc<dyn ChunkMap>,
+    reader: Arc<dyn BlobReader>,
     compressor: compress::Algorithm,
     digester: digest::Algorithm,
+    is_legacy_stargz: bool,
+    need_validation: bool,
 }
 
-impl RafsCache for DummyCache {
-    fn backend(&self) -> &(dyn BlobBackend + Sync + Send) {
-        self.backend.as_ref()
+impl BlobCache for DummyCache {
+    fn blob_id(&self) -> &str {
+        &self.blob_id
     }
 
-    fn has(&self, _cki: &dyn RafsChunkInfo) -> bool {
-        true
+    fn blob_uncompressed_size(&self) -> Result<u64> {
+        Ok(self.blob_info.uncompressed_size())
     }
 
-    fn init(&self, prefetch_vec: &[BlobPrefetchControl]) -> Result<()> {
-        for b in prefetch_vec {
-            let _ = self.backend.prefetch_blob(&b.blob_id, b.offset, b.len);
-        }
-        Ok(())
+    fn blob_compressed_size(&self) -> Result<u64> {
+        self.reader.blob_size().map_err(|e| eother!(e))
     }
 
-    fn evict(&self, _cki: &dyn RafsChunkInfo) -> Result<()> {
-        Ok(())
-    }
-
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn read(&self, bio: &RafsBio, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
-        let blob_id = &bio.blob_id;
-        let chunk = &bio.chunkinfo;
-        let mut reuse = false;
-
-        let d_size = chunk.decompress_size() as usize;
-
-        let mut d;
-        let one_chunk_buf = if bufs.len() == 1 && offset == 0 && bufs[0].len() >= d_size {
-            // Use the destination buffer to received the decompressed data.
-            reuse = true;
-            unsafe { std::slice::from_raw_parts_mut(bufs[0].as_ptr(), d_size) }
-        } else {
-            d = alloc_buf(d_size);
-            d.as_mut_slice()
-        };
-
-        self.read_backend_chunk(blob_id, chunk.as_ref(), one_chunk_buf, |_, _| Ok(()))?;
-
-        if reuse {
-            Ok(one_chunk_buf.len())
-        } else {
-            copyv(one_chunk_buf, bufs, offset, bio.size)
-        }
-    }
-
-    fn blob_size(&self, blob_id: &str) -> Result<u64> {
-        self.backend().blob_size(blob_id).map_err(|e| eother!(e))
-    }
-
-    fn digester(&self) -> digest::Algorithm {
-        self.digester
-    }
-
-    fn compressor(&self) -> compress::Algorithm {
+    fn blob_compressor(&self) -> compress::Algorithm {
         self.compressor
     }
 
-    fn need_validate(&self) -> bool {
-        self.validate
+    fn blob_cipher(&self) -> Algorithm {
+        self.blob_info.cipher()
     }
 
-    /// Prefetch works when blobcache is enabled
-    fn prefetch(&self, _bios: &mut [RafsBio]) -> StorageResult<usize> {
-        Err(StorageError::Unsupported)
+    fn blob_cipher_object(&self) -> Arc<Cipher> {
+        self.blob_info.cipher_object()
+    }
+
+    fn blob_cipher_context(&self) -> Option<CipherContext> {
+        self.blob_info.cipher_context()
+    }
+
+    fn blob_digester(&self) -> digest::Algorithm {
+        self.digester
+    }
+
+    fn is_legacy_stargz(&self) -> bool {
+        self.is_legacy_stargz
+    }
+
+    fn need_validation(&self) -> bool {
+        self.need_validation
+    }
+
+    fn reader(&self) -> &dyn BlobReader {
+        &*self.reader
+    }
+
+    fn get_chunk_map(&self) -> &Arc<dyn ChunkMap> {
+        &self.chunk_map
+    }
+
+    fn get_chunk_info(&self, _chunk_index: u32) -> Option<Arc<dyn BlobChunkInfo>> {
+        None
+    }
+
+    fn start_prefetch(&self) -> StorageResult<()> {
+        Ok(())
     }
 
     fn stop_prefetch(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn is_prefetch_active(&self) -> bool {
+        false
+    }
+
+    fn prefetch(
+        &self,
+        _blob_cache: Arc<dyn BlobCache>,
+        _prefetches: &[BlobPrefetchRequest],
+        _bios: &[BlobIoDesc],
+    ) -> StorageResult<usize> {
         Err(StorageError::Unsupported)
     }
 
-    fn write(&self, blob_id: &str, blk: &dyn RafsChunkInfo, buf: &[u8]) -> Result<usize> {
-        let out;
-        let wbuf = if blk.is_compressed() {
-            out = compress::compress(buf, self.compressor())?;
-            out.0.as_ref()
-        } else {
-            unsafe { slice::from_raw_parts(buf.as_ptr(), buf.len()) }
-        };
+    fn read(&self, iovec: &mut BlobIoVec, bufs: &[FileVolatileSlice]) -> Result<usize> {
+        let bios = &iovec.bi_vec;
 
-        self.backend
-            .write(blob_id, wbuf, blk.compress_offset())
-            .map_err(|e| eother!(e))
-    }
+        if iovec.size() == 0 || bios.is_empty() {
+            return Err(einval!("parameter `bios` is empty"));
+        }
 
-    fn release(&self) {
-        self.backend().release()
+        let bios_len = bios.len();
+        let offset = bios[0].offset;
+        let d_size = bios[0].chunkinfo.uncompressed_size() as usize;
+        // Use the destination buffer to receive the uncompressed data if possible.
+        if bufs.len() == 1 && bios_len == 1 && offset == 0 && bufs[0].len() >= d_size {
+            if !bios[0].user_io {
+                return Ok(0);
+            }
+            let buf = unsafe { std::slice::from_raw_parts_mut(bufs[0].as_ptr(), d_size) };
+            self.read_chunk_from_backend(&bios[0].chunkinfo, buf)?;
+            return Ok(buf.len());
+        }
+
+        let mut user_size = 0;
+        let mut buffer_holder: Vec<AlignedBuf> = Vec::with_capacity(bios.len());
+        for bio in bios.iter() {
+            if bio.user_io {
+                let mut d = alloc_buf(bio.chunkinfo.uncompressed_size() as usize);
+                self.read_chunk_from_backend(&bio.chunkinfo, d.as_mut_slice())?;
+                buffer_holder.push(d);
+                // Even a merged IO can hardly reach u32::MAX. So this is safe
+                user_size += bio.size;
+            }
+        }
+
+        copyv(
+            &buffer_holder,
+            bufs,
+            offset as usize,
+            user_size as usize,
+            0,
+            0,
+        )
+        .map(|(n, _)| n)
+        .map_err(|e| eother!(e))
     }
 }
 
-pub fn new(
-    config: CacheConfig,
-    backend: Arc<dyn BlobBackend + Sync + Send>,
-    compressor: compress::Algorithm,
-    digester: digest::Algorithm,
-) -> Result<DummyCache> {
-    Ok(DummyCache {
-        backend,
-        validate: config.cache_validate,
-        compressor,
-        digester,
-    })
+/// A dummy implementation of [BlobCacheMgr](../trait.BlobCacheMgr.html), simply reporting each
+/// chunk as cached or not cached according to configuration.
+///
+/// The `DummyCacheMgr` is a dummy implementation of the `BlobCacheMgr`, which doesn't really cache
+/// data. Instead it just reads data from the backend, uncompressed it if needed and then pass on
+/// the data to the clients.
+pub struct DummyCacheMgr {
+    backend: Arc<dyn BlobBackend>,
+    cached: bool,
+    need_validation: bool,
+    closed: AtomicBool,
+}
+
+impl DummyCacheMgr {
+    /// Create a new instance of `DummyCacheMgr`.
+    pub fn new(
+        config: &CacheConfigV2,
+        backend: Arc<dyn BlobBackend>,
+        cached: bool,
+    ) -> Result<DummyCacheMgr> {
+        Ok(DummyCacheMgr {
+            backend,
+            cached,
+            need_validation: config.cache_validate,
+            closed: AtomicBool::new(false),
+        })
+    }
+}
+
+impl BlobCacheMgr for DummyCacheMgr {
+    fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        if !self.closed.load(Ordering::Acquire) {
+            self.closed.store(true, Ordering::Release);
+            self.backend().shutdown();
+        }
+    }
+
+    fn gc(&self, _id: Option<&str>) -> bool {
+        false
+    }
+
+    fn backend(&self) -> &dyn BlobBackend {
+        self.backend.as_ref()
+    }
+
+    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> Result<Arc<dyn BlobCache>> {
+        if blob_info.has_feature(BlobFeatures::ZRAN) {
+            return Err(einval!(
+                "BlobCacheMgr doesn't support ZRan based RAFS data blobs"
+            ));
+        }
+
+        let blob_id = blob_info.blob_id();
+        let reader = self.backend.get_reader(&blob_id).map_err(|e| eother!(e))?;
+
+        Ok(Arc::new(DummyCache {
+            blob_id,
+            blob_info: blob_info.clone(),
+            chunk_map: Arc::new(NoopChunkMap::new(self.cached)),
+            reader,
+            compressor: blob_info.compressor(),
+            digester: blob_info.digester(),
+            is_legacy_stargz: blob_info.is_legacy_stargz(),
+            need_validation: self.need_validation
+                && !blob_info.is_legacy_stargz()
+                && !blob_info.is_external(),
+        }))
+    }
+
+    fn check_stat(&self) {}
+}
+
+impl Drop for DummyCacheMgr {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+
+    use nydus_api::ConfigV2;
+    use nydus_utils::crc32::{self, Crc32};
+    use nydus_utils::digest::RafsDigest;
+    use nydus_utils::metrics::BackendMetrics;
+    use vmm_sys_util::tempdir::TempDir;
+
+    use crate::{
+        cache::state::IndexedChunkMap,
+        device::{BlobChunkFlags, BlobIoChunk, BlobIoRange},
+        meta::tests::DummyBlobReader,
+        test::{MockBackend, MockChunkInfo},
+    };
+
+    use super::*;
+
+    fn new_validation_cache(need_validation: bool, is_legacy_stargz: bool) -> DummyCache {
+        let info = BlobInfo::new(
+            0,
+            "blob-0".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::empty(),
+        );
+        DummyCache {
+            blob_id: "0".to_string(),
+            blob_info: Arc::new(info),
+            chunk_map: Arc::new(NoopChunkMap::new(false)),
+            reader: Arc::new(MockBackend {
+                metrics: BackendMetrics::new("dummy", "localfs"),
+            }),
+            compressor: compress::Algorithm::None,
+            digester: digest::Algorithm::Sha256,
+            is_legacy_stargz,
+            need_validation,
+        }
+    }
+
+    #[test]
+    fn test_validate_chunk_data() {
+        let data = b"nydus-chunk-data";
+        let tampered = b"nydus-chunk-evil";
+        assert_eq!(data.len(), tampered.len());
+
+        // The chunk digest is trusted (anchored in the bootstrap/ToC), while both the
+        // `has_crc32` flag and the CRC32 value may come from the unauthenticated blob.meta.
+        // Model an attacker who substitutes the chunk data and supplies a matching CRC32.
+        let chunk = MockChunkInfo {
+            block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
+            flags: BlobChunkFlags::HAS_CRC32,
+            uncompress_size: data.len() as u32,
+            crc32: Crc32::new(crc32::Algorithm::Crc32Iscsi).from_buf(tampered),
+            ..Default::default()
+        };
+        let plain_chunk = MockChunkInfo {
+            block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
+            flags: BlobChunkFlags::empty(),
+            uncompress_size: data.len() as u32,
+            ..Default::default()
+        };
+
+        // Digest validation enabled: the digest must be checked, a matching CRC32 is not enough.
+        let cache = new_validation_cache(true, false);
+        let err = cache
+            .validate_chunk_data(&chunk, tampered, false)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("digest"), "{}", err);
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, data, false).unwrap(),
+            data.len()
+        );
+        assert!(cache
+            .validate_chunk_data(&plain_chunk, tampered, false)
+            .is_err());
+        assert_eq!(
+            cache
+                .validate_chunk_data(&plain_chunk, data, false)
+                .unwrap(),
+            data.len()
+        );
+
+        // Digest validation disabled: only the CRC32 is checked, if available.
+        let cache = new_validation_cache(false, false);
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, tampered, false).unwrap(),
+            data.len()
+        );
+        let err = cache.validate_chunk_data(&chunk, data, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("crc32"), "{}", err);
+        assert_eq!(
+            cache
+                .validate_chunk_data(&plain_chunk, tampered, false)
+                .unwrap(),
+            data.len()
+        );
+
+        // Forced validation behaves like enabled digest validation.
+        assert!(cache.validate_chunk_data(&chunk, tampered, true).is_err());
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, data, true).unwrap(),
+            data.len()
+        );
+
+        // Buffer size must match the uncompressed chunk size.
+        assert!(cache
+            .validate_chunk_data(&chunk, &tampered[..8], false)
+            .is_err());
+
+        // Legacy stargz blobs have no verifiable chunk digest or CRC32.
+        let cache = new_validation_cache(true, true);
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, tampered, false).unwrap(),
+            data.len()
+        );
+    }
+
+    #[test]
+    fn test_dummy_cache() {
+        let info = BlobInfo::new(
+            0,
+            "blob-0".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::empty(),
+        );
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir
+            .as_path()
+            .join("blob-0")
+            .as_os_str()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let chunkmap = IndexedChunkMap::new(blob_path.as_str(), 100, true).unwrap();
+        let chunkmap_unuse = IndexedChunkMap::new(blob_path.as_str(), 100, true).unwrap();
+
+        let f = OpenOptions::new()
+            .truncate(true)
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(blob_path.as_str())
+            .unwrap();
+        assert!(f.set_len(800).is_ok());
+        let reader: Arc<dyn BlobReader> = Arc::new(DummyBlobReader {
+            metrics: BackendMetrics::new("dummy", "localfs"),
+            file: f,
+        });
+        let cache = DummyCache {
+            blob_id: "0".to_string(),
+            blob_info: Arc::new(info.clone()),
+            chunk_map: Arc::new(chunkmap),
+            reader: reader.clone(),
+            compressor: compress::Algorithm::None,
+            digester: digest::Algorithm::Blake3,
+            is_legacy_stargz: false,
+            need_validation: false,
+        };
+
+        let cache_unuse = DummyCache {
+            blob_id: "1".to_string(),
+            blob_info: Arc::new(info.clone()),
+            chunk_map: Arc::new(chunkmap_unuse),
+            reader,
+            compressor: compress::Algorithm::None,
+            digester: digest::Algorithm::Blake3,
+            is_legacy_stargz: false,
+            need_validation: false,
+        };
+
+        assert!(cache.get_legacy_stargz_size(0, 100).is_ok());
+        assert!(!cache.is_zran());
+        assert!(!cache.is_batch());
+        assert!(cache.get_blob_object().is_none());
+        assert!(cache.prefetch_range(&BlobIoRange::default()).is_err());
+        assert_eq!(cache.blob_id, "0");
+        assert_eq!(cache.blob_uncompressed_size().unwrap(), 800);
+        assert_eq!(cache.blob_compressed_size().unwrap(), 0);
+        assert_eq!(cache.blob_compressor(), compress::Algorithm::None);
+        assert_eq!(cache.blob_cipher(), Algorithm::None);
+        match cache.blob_cipher_object().as_ref() {
+            Cipher::None => {}
+            _ => panic!(),
+        }
+        assert!(cache.blob_cipher_context().is_none());
+        assert_eq!(cache.blob_digester(), digest::Algorithm::Blake3);
+        assert!(!cache.is_legacy_stargz());
+        assert!(!cache.need_validation());
+        let _r = cache.reader();
+        let _m = cache.get_chunk_map();
+        assert!(cache.get_chunk_info(0).is_none());
+
+        assert!(cache.start_prefetch().is_ok());
+        let reqs = BlobPrefetchRequest {
+            blob_id: "blob-0".to_string(),
+            offset: 0,
+            len: 10,
+        };
+        let iovec_arr: &[BlobIoDesc] = &[];
+        let reqs = &[reqs];
+
+        assert!(cache
+            .prefetch(Arc::new(cache_unuse), reqs, iovec_arr)
+            .is_err());
+        assert!(cache.stop_prefetch().is_ok());
+        let mut iovec = BlobIoVec::new(Arc::new(info.clone()));
+        let chunk: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {
+            block_id: Default::default(),
+            blob_index: 0,
+            flags: Default::default(),
+            compress_size: 0,
+            uncompress_size: 800,
+            compress_offset: 0,
+            uncompress_offset: 0,
+            file_offset: 0,
+            index: 0,
+            crc32: 0,
+        });
+        iovec.push(BlobIoDesc::new(
+            Arc::new(info.clone()),
+            BlobIoChunk::from(chunk.clone()),
+            0,
+            10,
+            true,
+        ));
+
+        let mut dst_buf1 = vec![0x0u8; 800];
+        let volatile_slice_1 =
+            unsafe { FileVolatileSlice::from_raw_ptr(dst_buf1.as_mut_ptr(), dst_buf1.len()) };
+        let bufs: &[FileVolatileSlice] = &[volatile_slice_1];
+        assert_eq!(cache.read(&mut iovec, bufs).unwrap(), 800);
+
+        let chunk2: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {
+            block_id: Default::default(),
+            blob_index: 0,
+            flags: Default::default(),
+            compress_size: 0,
+            uncompress_size: 100,
+            compress_offset: 0,
+            uncompress_offset: 0,
+            file_offset: 0,
+            index: 0,
+            crc32: 0,
+        });
+
+        let chunk3: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {
+            block_id: Default::default(),
+            blob_index: 0,
+            flags: Default::default(),
+            compress_size: 0,
+            uncompress_size: 100,
+            compress_offset: 100,
+            uncompress_offset: 0,
+            file_offset: 0,
+            index: 0,
+            crc32: 0,
+        });
+
+        let mut iovec = BlobIoVec::new(Arc::new(info.clone()));
+
+        iovec.push(BlobIoDesc::new(
+            Arc::new(info.clone()),
+            BlobIoChunk::from(chunk2.clone()),
+            0,
+            100,
+            true,
+        ));
+
+        iovec.push(BlobIoDesc::new(
+            Arc::new(info),
+            BlobIoChunk::from(chunk3.clone()),
+            100,
+            100,
+            true,
+        ));
+
+        let mut dst_buf2 = vec![0x0u8; 100];
+        let mut dst_buf3 = vec![0x0u8; 100];
+        let volatile_slice_2 =
+            unsafe { FileVolatileSlice::from_raw_ptr(dst_buf2.as_mut_ptr(), dst_buf2.len()) };
+
+        let volatile_slice_3 =
+            unsafe { FileVolatileSlice::from_raw_ptr(dst_buf3.as_mut_ptr(), dst_buf3.len()) };
+        let bufs: &[FileVolatileSlice] = &[volatile_slice_2, volatile_slice_3];
+        assert_eq!(cache.read(&mut iovec, bufs).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_dummy_cache_mgr() {
+        let content = r#"version=2
+        id = "my_id"
+        metadata_path = "meta_path"
+        [backend]
+        type = "localfs"
+        [backend.localfs]
+        blob_file = "/tmp/nydus.blob.data"
+        dir = "/tmp"
+        alt_dirs = ["/var/nydus/cache"]
+        [cache]
+        type = "filecache"
+        compressed = true
+        validate = true
+        [cache.filecache]
+        work_dir = "/tmp"
+        "#;
+
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        let backend = MockBackend {
+            metrics: BackendMetrics::new("dummy", "localfs"),
+        };
+        let mgr =
+            DummyCacheMgr::new(cfg.get_cache_config().unwrap(), Arc::new(backend), false).unwrap();
+        assert!(mgr.init().is_ok());
+        assert!(!mgr.gc(Some("blob-0")));
+
+        // Digest validation is enabled by the config, so a regular blob gets validated.
+        let info = Arc::new(BlobInfo::new(
+            0,
+            "blob-0".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::empty(),
+        ));
+        assert!(mgr.get_blob_cache(&info).unwrap().need_validation());
+
+        // External blobs have no chunk digest, their chunk id is all zero. Digest validation
+        // must be skipped for them, otherwise every read would fail.
+        let external_info = Arc::new(BlobInfo::new(
+            1,
+            "blob-1".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::EXTERNAL,
+        ));
+        assert!(!mgr
+            .get_blob_cache(&external_info)
+            .unwrap()
+            .need_validation());
+
+        let _bak = mgr.backend();
+        mgr.check_stat();
+        mgr.destroy();
+        assert!(mgr.closed.load(Ordering::Acquire));
+        drop(mgr);
+    }
 }

@@ -2,40 +2,62 @@
 
 `nydusd` running as daemon to expose a [FUSE](https://www.kernel.org/doc/html/latest/filesystems/fuse.html) mountpoint or a [Virtio-FS](https://virtio-fs.gitlab.io/) mountpoint inside guest for containers to access.
 
+### Get binary from release page
+
+Get `nydusd` binary from [release](https://github.com/dragonflyoss/nydus/releases/latest) page.
+
 ## Run Nydusd Daemon
 
-``` shell
+```shell
 # Prepare nydusd configuration
-cat /path/to/config-localfs.json
+sudo tee /etc/nydus/nydusd-config.localfs.json > /dev/null << EOF
 {
   "device": {
     "backend": {
       "type": "localfs",
       "config": {
-        "dir": "/path/to/blobs",
+        "dir": "/var/lib/nydus/blobs"
+      }
+    },
+    "cache": {
+      "type": "blobcache",
+      "config": {
+        "work_dir": "/var/lib/nydus/cache"
       }
     }
-  }
+  },
+  "mode": "direct",
+  "digest_validate": false,
+  "iostats_files": false,
+  "enable_xattr": true
 }
+
+EOF
 ```
 
 ### Run With FUSE
+If no `/path/to/bootstrap` is available, please refer to [nydus-image.md](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md) for more details.
 
 ``` shell
-sudo target-fusedev/debug/nydusd \
-  --config /path/to/config-localfs.json \
+sudo mkdir -p /var/lib/nydus/blobs/
+sudo mkdir -p /var/lib/nydus/cache/
+sudo nydusd \
+  --config /etc/nydus/nydusd-config.localfs.json \
   --mountpoint /path/to/mnt \
   --bootstrap /path/to/bootstrap \
   --log-level info
 ```
 
+For registry backend, we can set authorization with environment variable `IMAGE_PULL_AUTH` to avoid loading `auth` from nydusd configuration file.
+
 ### Run With Virtio-FS
+If no `/path/to/bootstrap` is available, please refer to [nydus-image.md](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md) for more details.
 
 Virtio-fs is supported by both [QEMU](https://www.qemu.org/) and [Cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor). To run `nydusd` with virtio-fs support, first start it with `--sock` option to expose a virtio-fs socket endpoint.
 
 ``` shell
-sudo target-virtiofs/debug/nydusd \
-  --config /path/to/config-localfs.json \
+sudo nydusd \
+  --config /etc/nydus/nydusd-config.localfs.json \
   --sock /path/to/vhost-user-fs.sock \
   --bootstrap /path/to/bootstrap \
   --log-level info
@@ -80,21 +102,12 @@ We are working on enabling cloud-hypervisor support for nydus.
       // localfs | oss | registry
       "type": "localfs",
       "config": {
-        // Access remote storage backend via P2P proxy, e.g. Dragonfly client
-        "proxy": "http://p2p-proxy:65001",
-        // Fallback to remote storage backend if P2P proxy ping failed
-        "proxy_fallback": true,
-        // Endpoint of P2P proxy health check
-        "proxy_ping_url": "http://p2p-proxy:40901/server/ping",
-        // Interval of P2P proxy checking, in seconds
-        "proxy_check_interval": 5,
         // Drop the read request once http request timeout, in seconds
         "timeout": 5,
         // Drop the read request once http connection timeout, in seconds
         "connect_timeout": 5,
         // Retry count when read request failed
         "retry_limit": 0,
-        ...
       }
     },
     "cache": {
@@ -117,6 +130,9 @@ We are working on enabling cloud-hypervisor support for nydus.
   "iostats_files": true,
   // Enable support of fs extended attributes
   "enable_xattr": false,
+  // Amplified user IO request batch size to read data from remote storage backend / local cache
+  // in unit of Bytes, valid values: 0-268435456, default: 1048576
+  "amplify_io": 1048576,
   "fs_prefetch": {
     // Enable blob prefetch
     "enable": false,
@@ -125,12 +141,21 @@ We are working on enabling cloud-hypervisor support for nydus.
     // Maximal read size per prefetch request, e.g. 128kb
     "merging_size": 131072,
     // Limit prefetch bandwidth to 1MB/S, it aims at reducing congestion with normal user io
-    "bandwidth_rate": 1048576
+    "bandwidth_rate": 1048576,
+    // Enable streaming blob prefetch for Dragonfly proxy optimization.
+    // When enabled, entire blobs are streamed via rangeless GET requests and
+    // cached locally, reducing per-chunk proxy round-trips. Only effective when
+    // "enable" is true. Reuses "threads_count" for concurrency and "bandwidth_rate"
+    // for bandwidth control (0 = no limit). Retries are fixed at 10 per blob.
+    // When stream_prefetch is true, normal fs prefetch is skipped.
+    "stream_prefetch": false
   }
 }
 ```
 
 #### Use Different Storage Backends
+
+Using different storage backend means that the nydus image metadata (bootstrap) layer is stored in the image registry, but the data layer will be stored on the external storage. Therefore, the option `--target` for `nydusify convert` is still required, the registry image reference is needed to store the metadata layer.
 
 ##### Localfs Backend
 
@@ -154,7 +179,32 @@ We are working on enabling cloud-hypervisor support for nydus.
 }
 ```
 
-##### OSS backend with blobcache
+##### Localdisk Backend (Experimental)
+Using this backend enables Nydus to support reading blobs from block devices. This feature will be useful in Confidential Computing or Hybrid Image scenarios.
+
+The localdisk backend adds support for storing images in disks. In this scenario, each layer of the blob is stored in partitions, and multiple partitions are addressed in the local raw disk via the GUID partition table (GPT), which means that this disk stores the entire image.
+
+Currently, generating a localdisk image through nydusify is not supported for the time being. You need to use the nydus-localdisk tool to complete this step.
+Document located at: https://github.com/adamqqqplay/nydus-localdisk/blob/master/README.md
+
+```
+{
+  "device": {
+    "backend": {
+      "type": "localdisk",
+      "config": {
+        // Mounted block device path or original localdisk image file path.
+        "device_path": "/dev/loop1"
+        //"device_path": "/home/user/ubuntu.img"
+      }
+    },
+    ...
+  },
+  ...
+}
+```
+
+##### OSS Backend
 
 ```
 {
@@ -164,9 +214,11 @@ We are working on enabling cloud-hypervisor support for nydus.
       "config": {
         ...
         "endpoint": "region.aliyuncs.com",
+        "scheme": "https",
         "access_key_id": "",
         "access_key_secret": "",
-        "bucket_name": ""
+        "bucket_name": "",
+        "object_prefix": "nydus/"
       }
     },
     ...
@@ -175,7 +227,31 @@ We are working on enabling cloud-hypervisor support for nydus.
 }
 ```
 
-##### Registry backend
+##### S3 Backend
+
+```
+{
+  "device": {
+    "backend": {
+      "type": "s3",
+      "config": {
+        ...
+        "endpoint": "s3.amazonaws.com",
+        "scheme": "https",
+        "access_key_id": "",
+        "access_key_secret": "",
+        "bucket_name": "",
+        "region": "",
+        "object_prefix": "nydus/"
+      }
+    },
+    ...
+  },
+  ...
+}
+```
+
+##### Registry Backend
 
 ```
 {
@@ -184,14 +260,102 @@ We are working on enabling cloud-hypervisor support for nydus.
       "type": "registry",
       "config": {
         ...
-        "scheme": "http",
+        // Registry url scheme, leave empty to automatically detect, otherwise specify to https or http.
+        "scheme": "",
+        // Registry hostname with format `$host:$port`
         "host": "my-registry:5000",
+        // Skip SSL certificate validation for HTTPS scheme.
+        // When true, also allows automatic HTTPS-to-HTTP fallback on TLS errors.
+        "skip_verify": false,
+        // Paths to PEM-encoded CA certificate files to trust in addition to the system CA store, optional.
+        // Useful when the registry uses a private or self-signed CA.
+        "ca_cert_files": ["/etc/ssl/certs/my-ca.pem"],
+        // Use format `$namespace/$repo` (no image tag)
         "repo": "test/repo",
         // Username and password for auth
         // base64(username:password), optional
         "auth": "<base64_encoded_auth>",
         // Bearer token for auth, optional
         "registry_token": "<bearer_token>"
+        // Redirected blob download host, optional
+        "blob_redirected_host": "<blob_redirected_host>"
+      }
+    },
+    ...
+  },
+  ...
+}
+``` 
+Note: The value of `device.backend.config.auth` will be overwrite if running the nydusd with environment variable `IMAGE_PULL_AUTH`.
+
+#### HTTP Proxy Backend
+
+The `HttpProxy` backend can access blobs through a http proxy server which can be local (using unix socket) or remote (using `https://` or using `http://`).
+
+`HttpProxy` uses two API endpoints to access the blobs:
+- `HEAD /path/to/blobs` to get the blob size
+- `GET /path/to/blobs` to read the blob
+
+The http proxy server should respect [the `Range` header](https://www.rfc-editor.org/rfc/rfc9110.html#name-range) to compute the offset and length of the blob.
+
+The example config files for the `HttpProxy` backend may be:
+
+```
+// for remote usage
+{
+  "device": {
+      "backend": {
+      "type": "http-proxy",
+      "config": {
+        "addr": "http://127.0.0.1:9977",
+        "path": "/namespace/<repo>/blobs"
+      }
+    }
+  }
+}
+```
+
+or
+
+```
+// for local usage
+{
+  "device": {
+      "backend": {
+      "type": "http-proxy",
+      "config": {
+        "addr": "/path/to/unix.sock",
+      }
+    }
+  }
+}
+```
+-
+- The `HttpProxy` backend also supports the `Proxy` configuration for remote usage like the `Registry backend` described above.
+##### Enable P2P Proxy for Storage Backend
+
+Add `device.backend.config.proxy` field to enable HTTP proxy for storage backend. For example, use P2P distribution service to reduce network workload and latency in large scale container cluster using [Dragonfly](https://d7y.io/) (enable centralized dfdaemon mode).
+
+```
+{
+  "device": {
+    "backend": {
+      "type": "registry",
+      "config": {
+        "proxy": {
+          // Access remote storage backend via P2P proxy, e.g. Dragonfly dfdaemon server URL
+          "url": "http://p2p-proxy:65001",
+          // Fallback to remote storage backend if P2P proxy ping failed
+          "fallback": true,
+          // Endpoint of P2P proxy health checking
+          "ping_url": "http://p2p-proxy:40901/server/ping",
+          // Interval of P2P proxy health checking, in seconds
+          "check_interval": 5
+          // Elapsed time to pause proxy health check when the request is inactive, in seconds.
+          // Use 300 as default if left empty.
+          "check_pause_elapsed": 300,
+        },
+        ...
       }
     },
     ...
@@ -200,12 +364,65 @@ We are working on enabling cloud-hypervisor support for nydus.
 }
 ```
 
+Once the configuration is loaded successfully on nydusd starting, we will see the log as shown below:
+
+```
+INFO [storage/src/backend/connection.rs:136] backend config: CommonConfig { proxy: ProxyConfig { url: "http://p2p-proxy:65001", ping_url: "http://p2p-proxy:40901/server/ping", fallback: true, check_interval: 5 }, timeout: 5, connect_timeout: 5, retry_limit: 0 }
+```
+
+### Mount writable Overlay FS
+
+`Nydusd` itself has a native userspace Overlay FS implementation, which can be enabled with several extra configurations. 
+
+An example configuration `/etc/nydus/nydusd-config.overlay.json` is as follows:
+
+```json
+{
+	"version": 2,
+	"backend": {
+		"type": "localfs",
+		"localfs": "/var/lib/nydus/blobs"
+	},
+	"cache": {
+		"type": "blobcache",
+		"filecache": {
+			"work_dir": "/var/lib/nydus/cache"
+		}
+	},
+	"rafs": {
+		"mode": "direct",
+		"enable_xattr": true
+	},
+	"overlay": {
+		"upper_dir": "/path/to/upperdir",
+		"work_dir": "/path/to/workdir"
+	}
+}
+```
+
+An extra field `overlay` is added to the Nydusd configuration, which specifies the `upper_dir` and `work_dir` for the overlay filesystem.
+
+You can start `nydusd` with the above configuration and such command:
+
+```bash
+sudo nydusd \
+    --config /etc/nydus/nydusd-config.overlay.json \
+    --mountpoint /path/to/mnt/ \
+    --bootstrap /path/to/bootstrap \
+    --log-level info \
+    --writable
+```
+
+This will create a FUSE overlay mountpoint at `/path/to/mnt/`, with one `Nydus` image as readonly lower layer and the `/path/to/upperdir` as writable upper layer, so that it can take over whole rootfs of a container, any contents writen from container will be stored in `/path/to/upperdir`.
+
+Removing `--writable` flag will make the overlay filesystem readonly if you wish.
+
 ### Mount Bootstrap Via API
 
 To mount a bootstrap via api, first launch nydusd without a bootstrap:
 
 ``` shell
-sudo target-fusedev/debug/nydusd \
+sudo nydusd \
   --apisock /path/to/api.sock \
   --config /path/to/config.json \
   --mountpoint /path/to/mountpoint
@@ -248,3 +465,48 @@ mnt
 ├── pseudo_1
 └── pseudo_2
 ```
+
+### Hot Reload Configuration
+
+Nydusd supports hot reloading of configuration without restarting the daemon. This is useful for updating credentials or other settings at runtime.
+
+#### Update Configuration
+
+To update configuration (e.g., registry authentication):
+
+```shell
+curl --unix-socket /path/to/api.sock \
+  -X PUT "http://localhost/api/v1/config?id=/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "registry_auth": "<base64_encoded_auth>"
+  }'
+```
+
+#### Query Current Configuration
+
+To retrieve the current configuration:
+
+```shell
+curl --unix-socket /path/to/api.sock \
+  -X GET "http://localhost/api/v1/config?id=/"
+```
+
+Example response:
+
+```json
+{
+  "registry_auth": "<base64_encoded_auth>"
+}
+```
+
+> **Note**: The `id` parameter specifies which mountpoint to configure. Use `/` for the root mountpoint or specify a sub-mountpoint path for multi-mount scenarios.
+
+#### Supported Configuration Fields
+
+The following fields can be updated via the hot reload API:
+
+| Field           | Description                                                               |
+| --------------- | ------------------------------------------------------------------------- |
+| `registry_auth` | Base64-encoded `username:password` credential for registry authentication |
+

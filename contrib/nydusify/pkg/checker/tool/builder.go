@@ -29,27 +29,22 @@ func NewBuilder(binaryPath string) *Builder {
 	}
 }
 
-// Check calls `nydus-image check` to parse Nydus bootstrap
+// Check calls `nydus-image check` to parse nydus bootstrap
 // and output debug information to specified JSON file.
 func (builder *Builder) Check(option BuilderOption) error {
-	var args []string
-	args = []string{
+	args := []string{
 		"check",
-		"--bootstrap",
-		option.BootstrapPath,
 		"--log-level",
 		"warn",
 		"--output-json",
 		option.DebugOutputPath,
+		"--bootstrap",
+		option.BootstrapPath,
 	}
 
 	cmd := exec.Command(builder.binaryPath, args...)
 	cmd.Stdout = builder.stdout
 	cmd.Stderr = builder.stderr
 
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
+	return cmd.Run()
 }

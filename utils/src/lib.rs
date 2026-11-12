@@ -2,69 +2,68 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::convert::{From, Infallible, Into, TryInto};
-use std::env::current_dir;
-use std::io::Result;
-use std::ops::{Add, BitAnd, Not, Sub};
-use std::path::PathBuf;
-
-use flexi_logger::{self, colored_opt_format, opt_format, Logger};
-use log::LevelFilter;
-use num_traits::CheckedAdd;
-use serde::Serialize;
-
 #[macro_use]
 extern crate log;
 #[macro_use]
 extern crate serde;
 #[macro_use]
 extern crate lazy_static;
-
 #[macro_use]
-pub mod error;
+extern crate nydus_api;
 
-pub mod exec;
-pub use exec::*;
+use std::convert::{Into, TryFrom, TryInto};
+use std::time::Duration;
 
-pub mod types;
-pub use types::*;
+pub use self::exec::*;
+pub use self::inode_bitmap::InodeBitmap;
+pub use self::reader::*;
+pub use self::types::*;
 
-#[cfg(feature = "fusedev")]
-pub mod fuse;
-#[cfg(feature = "fusedev")]
-pub use self::fuse::{FuseChannel, FuseSession};
+pub mod async_helper;
+pub mod compact;
+pub mod compress;
+pub mod config;
+pub mod crc32;
+#[cfg(feature = "encryption")]
+pub mod crypt;
 pub mod digest;
+pub mod exec;
+pub mod filemap;
+pub mod inode_bitmap;
 pub mod logger;
-
 pub mod metrics;
-pub mod signal;
+pub mod mpmc;
+pub mod reader;
+pub mod singleflight;
+pub mod trace;
+pub mod types;
+pub mod verity;
 
-pub fn log_level_to_verbosity(level: log::LevelFilter) -> usize {
-    level as usize - 1
+/// Round up and divide the value `n` by `d`.
+pub fn div_round_up(n: u64, d: u64) -> u64 {
+    debug_assert!(d != 0);
+    debug_assert!(d.is_power_of_two());
+    n.div_ceil(d)
 }
 
-pub fn div_round_up(n: u64, d: u64) -> u64 {
-    (n + d - 1) / d
+/// Round up the value `n` to by `d`.
+pub fn round_up(n: u64, d: u64) -> u64 {
+    debug_assert!(d != 0);
+    debug_assert!(d.is_power_of_two());
+    n.div_ceil(d) * d
+}
+
+/// Round up the value `n` to by `d`.
+pub fn round_up_usize(n: usize, d: usize) -> usize {
+    debug_assert!(d != 0);
+    debug_assert!(d.is_power_of_two());
+    n.div_ceil(d) * d
 }
 
 /// Overflow can fail this rounder if the base value is large enough with 4095 added.
-pub fn try_round_up_4k<
-    U,
-    E: From<Infallible>,
-    T: BitAnd<Output = T>
-        + Not<Output = T>
-        + Add<Output = T>
-        + Sub<Output = T>
-        + TryInto<U, Error = E>
-        + From<u16>
-        + PartialOrd
-        + CheckedAdd
-        + Copy,
->(
-    x: T,
-) -> Option<U> {
-    let t: T = 4095u16.into();
-    if let Some(v) = x.checked_add(&t) {
+pub fn try_round_up_4k<U: TryFrom<u64>, T: Into<u64>>(x: T) -> Option<U> {
+    let t = 4095u64;
+    if let Some(v) = x.into().checked_add(t) {
         let z = v & (!t);
         z.try_into().ok()
     } else {
@@ -76,124 +75,58 @@ pub fn round_down_4k(x: u64) -> u64 {
     x & (!4095u64)
 }
 
-pub mod built_info {
-    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+/// Round down the value `n` to by `d`.
+pub fn round_down(n: u64, d: u64) -> u64 {
+    debug_assert!(d != 0);
+    debug_assert!(d.is_power_of_two());
+    n / d * d
 }
 
-pub fn dump_program_info(prog_version: &str) {
-    info!(
-        "Program Version: {}, Git Commit: {:?}, Build Time: {:?}, Profile: {:?}, Rustc Version: {:?}",
-        prog_version,
-        built_info::GIT_COMMIT_HASH.unwrap_or_default(),
-        built_info::BUILT_TIME_UTC,
-        built_info::PROFILE,
-        built_info::RUSTC_VERSION,
-    );
+pub enum DelayType {
+    Fixed,
+    // an exponential delay between each attempts
+    BackOff,
 }
 
-#[derive(Serialize, Clone)]
-pub struct BuildTimeInfo {
-    package_ver: String,
-    git_commit: String,
-    build_time: String,
-    profile: String,
-    rustc: String,
+pub struct Delayer {
+    r#type: DelayType,
+    attempts: u32,
+    time: Duration,
 }
 
-impl<'a> BuildTimeInfo {
-    pub fn dump(package_ver: &'a str) -> (String, Self) {
-        let info_string = format!(
-            "\rVersion: \t{}\nGit Commit: \t{}\nBuild Time: \t{}\nProfile: \t{}\nRustc: \t\t{}\n",
-            package_ver,
-            built_info::GIT_COMMIT_HASH.unwrap_or_default(),
-            built_info::BUILT_TIME_UTC,
-            built_info::PROFILE,
-            built_info::RUSTC_VERSION,
-        );
+impl Delayer {
+    pub fn new(t: DelayType, time: Duration) -> Self {
+        Delayer {
+            r#type: t,
+            attempts: 0,
+            time,
+        }
+    }
 
-        let info = Self {
-            package_ver: package_ver.to_string(),
-            git_commit: built_info::GIT_COMMIT_HASH.unwrap_or_default().to_string(),
-            build_time: built_info::BUILT_TIME_UTC.to_string(),
-            profile: built_info::PROFILE.to_string(),
-            rustc: built_info::RUSTC_VERSION.to_string(),
-        };
+    pub fn delay(&mut self) {
+        use std::thread::sleep;
 
-        (info_string, info)
+        match self.r#type {
+            DelayType::Fixed => sleep(self.time),
+            DelayType::BackOff => sleep((1 << self.attempts) * self.time),
+        }
+        self.attempts += 1;
     }
 }
 
-/// `log_file_path` absolute path to logging files or relative path from current working
-/// directory to logging file.
-/// Flexi logger always appends a suffix to file name whose default value is ".log"
-/// unless we set it intentionally. I don't like this passion. When the basename of `log_file_path`
-/// is "bar", the newly created log file will be "bar.log"
-pub fn setup_logging(log_file_path: Option<PathBuf>, level: LevelFilter) -> Result<()> {
-    if let Some(ref path) = log_file_path {
-        // Do not try to canonicalize the path since the file may not exist yet.
+struct LazyDrop<T> {
+    v: T,
+}
 
-        // We rely on rust `log` macro to limit current log level rather than `flexi_logger`
-        // So we set `flexi_logger` log level to "trace" which is High enough. Otherwise, we
-        // can't change log level to a higher level than what is passed to `flexi_logger`.
-        let mut logger = Logger::with_env_or_str("trace")
-            .log_to_file()
-            .suppress_timestamp()
-            .append()
-            .format(opt_format);
+unsafe impl<T> Send for LazyDrop<T> {}
 
-        // Parse log file to get the `basename` and `suffix`(extension) because `flexi_logger`
-        // will automatically add `.log` suffix if we don't set explicitly, see:
-        // https://github.com/emabee/flexi_logger/issues/74
-        let basename = path
-            .file_stem()
-            .ok_or_else(|| {
-                eprintln!("invalid file name input {:?}", path);
-                einval!()
-            })?
-            .to_str()
-            .ok_or_else(|| {
-                eprintln!("invalid file name input {:?}", path);
-                einval!()
-            })?;
-        logger = logger.basename(basename);
-
-        // `flexi_logger` automatically add `.log` suffix if the file name has not extension.
-        if let Some(suffix) = path.extension() {
-            let suffix = suffix.to_str().ok_or_else(|| {
-                eprintln!("invalid file extension {:?}", suffix);
-                einval!()
-            })?;
-            logger = logger.suffix(suffix);
-        }
-
-        // Set log directory
-        let parent_dir = path.parent();
-        if let Some(p) = parent_dir {
-            let cwd = current_dir()?;
-            let dir = if !p.has_root() {
-                cwd.join(p)
-            } else {
-                p.to_path_buf()
-            };
-            logger = logger.directory(dir);
-        }
-
-        logger.start().map_err(|e| {
-            eprintln!("{:?}", e);
-            eother!(e)
-        })?;
-    } else {
-        // We rely on rust `log` macro to limit current log level rather than `flexi_logger`
-        // So we set `flexi_logger` log level to "trace" which is High enough. Otherwise, we
-        // can't change log level to a higher level than what is passed to `flexi_logger`.
-        Logger::with_env_or_str("trace")
-            .format(colored_opt_format)
-            .start()
-            .map_err(|e| eother!(e))?;
-    }
-
-    log::set_max_level(level);
-    Ok(())
+/// Lazy drop of object.
+pub fn lazy_drop<T: 'static>(v: T) {
+    let v = LazyDrop { v };
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(600));
+        let _ = v.v;
+    });
 }
 
 #[cfg(test)]
@@ -211,27 +144,62 @@ mod tests {
         assert_eq!(round_down_4k(u64::MAX - 1), u64::MAX - 4095);
         assert_eq!(round_down_4k(u64::MAX - 4095), u64::MAX - 4095);
         // zero is rounded up to zero
-        assert_eq!(try_round_up_4k::<i32, _, _>(0u32), Some(0i32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(0u32), Some(0u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(1u32), Some(4096u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(100u32), Some(4096u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(4100u32), Some(8192u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(4096u32), Some(4096u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(4095u32), Some(4096u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(4097u32), Some(8192u32));
-        assert_eq!(try_round_up_4k::<u32, _, _>(u32::MAX), None);
-        assert_eq!(try_round_up_4k::<u64, _, _>(u32::MAX), None);
-        assert_eq!(try_round_up_4k::<u32, _, _>(u64::MAX - 1), None);
-        assert_eq!(try_round_up_4k::<u32, _, _>(u64::MAX), None);
-        assert_eq!(try_round_up_4k::<u32, _, _>(u64::MAX - 4097), None);
+        assert_eq!(try_round_up_4k::<i32, _>(0u32), Some(0i32));
+        assert_eq!(try_round_up_4k::<u32, _>(0u32), Some(0u32));
+        assert_eq!(try_round_up_4k::<u32, _>(1u32), Some(4096u32));
+        assert_eq!(try_round_up_4k::<u32, _>(100u32), Some(4096u32));
+        assert_eq!(try_round_up_4k::<u32, _>(4100u32), Some(8192u32));
+        assert_eq!(try_round_up_4k::<u32, _>(4096u32), Some(4096u32));
+        assert_eq!(try_round_up_4k::<u32, _>(4095u32), Some(4096u32));
+        assert_eq!(try_round_up_4k::<u32, _>(4097u32), Some(8192u32));
+        assert_eq!(try_round_up_4k::<u32, _>(u32::MAX), None);
+        assert_eq!(try_round_up_4k::<u64, _>(u32::MAX), Some(0x1_0000_0000u64));
+        assert_eq!(try_round_up_4k::<u32, _>(u64::MAX - 1), None);
+        assert_eq!(try_round_up_4k::<u32, _>(u64::MAX), None);
+        assert_eq!(try_round_up_4k::<u32, _>(u64::MAX - 4097), None);
         // success
         assert_eq!(
-            try_round_up_4k::<u64, _, _>(u64::MAX - 4096),
+            try_round_up_4k::<u64, _>(u64::MAX - 4096),
             Some(u64::MAX - 4095)
         );
         // overflow
-        assert_eq!(try_round_up_4k::<u64, _, _>(u64::MAX - 1), None);
+        assert_eq!(try_round_up_4k::<u64, _>(u64::MAX - 1), None);
         // fail to convert u64 to u32
-        assert_eq!(try_round_up_4k::<u32, _, _>(u64::MAX - 4096), None);
+        assert_eq!(try_round_up_4k::<u32, _>(u64::MAX - 4096), None);
+    }
+
+    #[test]
+    fn test_round_up_usize() {
+        assert_eq!(round_up_usize(10, 8), 16);
+        assert_eq!(round_up_usize(100, 8), 104);
+        assert_eq!(round_up_usize(1000, 8), 1000);
+    }
+
+    #[test]
+    fn test_round_helpers() {
+        assert_eq!(div_round_up(0, 8), 0);
+        assert_eq!(div_round_up(1, 8), 1);
+        assert_eq!(div_round_up(9, 8), 2);
+
+        assert_eq!(round_up(0, 8), 0);
+        assert_eq!(round_up(9, 8), 16);
+        assert_eq!(round_up(16, 8), 16);
+
+        assert_eq!(round_down(0, 8), 0);
+        assert_eq!(round_down(15, 8), 8);
+        assert_eq!(round_down(16, 8), 16);
+    }
+
+    #[test]
+    fn test_delayer_attempts() {
+        let mut fixed = Delayer::new(DelayType::Fixed, Duration::from_millis(0));
+        fixed.delay();
+        fixed.delay();
+        assert_eq!(fixed.attempts, 2);
+
+        let mut backoff = Delayer::new(DelayType::BackOff, Duration::from_millis(0));
+        backoff.delay();
+        backoff.delay();
+        assert_eq!(backoff.attempts, 2);
     }
 }

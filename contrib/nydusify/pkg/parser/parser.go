@@ -9,15 +9,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"strings"
 
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/remote"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/utils"
-
-	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/v2/core/images"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/remote"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
 // Parser parses OCI & Nydus image manifest, manifest index and
@@ -25,6 +25,11 @@ import (
 // examples/manifest/index.json, examples/manifest/manifest.json.
 type Parser struct {
 	Remote *remote.Remote
+	// Principle to select platform arch/os is that nydus only works on top of linux
+	// and interestedArch has to be specified in case of manifest list. So nydusify
+	// knows how to choose the source image. In case of single manifest, `interestedArch`
+	// is the same with origin.
+	interestedArch string
 }
 
 // Image presents image contents.
@@ -37,22 +42,27 @@ type Image struct {
 // Parsed presents OCI and Nydus image manifest.
 // Nydus image conversion only works on top of an existed oci image whose platform is linux/amd64
 type Parsed struct {
-	Index *ocispec.Index
+	Remote *remote.Remote
+	Index  *ocispec.Index
 	// The base image from which to generate nydus image.
 	OCIImage   *Image
 	NydusImage *Image
 }
 
 // New creates Nydus image parser instance.
-func New(remote *remote.Remote) *Parser {
-	return &Parser{
-		Remote: remote,
+func New(remote *remote.Remote, interestedArch string) (*Parser, error) {
+	if !utils.IsSupportedArch(interestedArch) {
+		return nil, fmt.Errorf("invalid arch %s", interestedArch)
 	}
+	return &Parser{
+		Remote:         remote,
+		interestedArch: interestedArch,
+	}, nil
 }
 
 // Try to find the topmost layer in Nydus manifest, it should
 // be a Nydus bootstrap layer, see examples/manifest/manifest.json
-func findNydusBootstrapDesc(manifest *ocispec.Manifest) *ocispec.Descriptor {
+func FindNydusBootstrapDesc(manifest *ocispec.Manifest) *ocispec.Descriptor {
 	layers := manifest.Layers
 	if len(layers) != 0 {
 		desc := &layers[len(layers)-1]
@@ -72,7 +82,7 @@ func (parser *Parser) pull(ctx context.Context, desc *ocispec.Descriptor, res in
 	}
 	defer reader.Close()
 
-	bytes, err := ioutil.ReadAll(reader)
+	bytes, err := io.ReadAll(reader)
 	if err != nil {
 		return errors.Wrap(err, "read image resource")
 	}
@@ -109,7 +119,7 @@ func (parser *Parser) pullIndex(ctx context.Context, desc *ocispec.Descriptor) (
 }
 
 func (parser *Parser) parseImage(
-	ctx context.Context, desc *ocispec.Descriptor, onlyManifest *ocispec.Manifest,
+	ctx context.Context, desc *ocispec.Descriptor, onlyManifest *ocispec.Manifest, ignoreArch bool,
 ) (*Image, error) {
 	var manifest *ocispec.Manifest
 	var err error
@@ -125,6 +135,26 @@ func (parser *Parser) parseImage(
 	if err != nil {
 		return nil, errors.Wrap(err, "pull image config")
 	}
+
+	if config.OS == "" || config.Architecture == "" {
+		err = errors.New("Source image configuration does not have os or architecture")
+		if ignoreArch {
+			logrus.WithError(err).Warn("Ignore image arch")
+		} else {
+			return nil, err
+		}
+	}
+
+	// Just give user a simple hint telling option was ignored.
+	if config.Architecture != parser.interestedArch {
+		err = errors.Errorf("Found arch %s, but the specified target arch (--platform) is %s", config.Architecture, parser.interestedArch)
+		if ignoreArch {
+			logrus.WithError(err).Warn("Ignore image arch, attempting to continue converting")
+		} else {
+			return nil, err
+		}
+	}
+
 	return &Image{
 		Desc:     *desc,
 		Manifest: *manifest,
@@ -134,7 +164,7 @@ func (parser *Parser) parseImage(
 
 // PullNydusBootstrap pulls Nydus bootstrap layer from Nydus image.
 func (parser *Parser) PullNydusBootstrap(ctx context.Context, image *Image) (io.ReadCloser, error) {
-	bootstrapDesc := findNydusBootstrapDesc(&image.Manifest)
+	bootstrapDesc := FindNydusBootstrapDesc(&image.Manifest)
 	if bootstrapDesc == nil {
 		return nil, fmt.Errorf("not found Nydus bootstrap layer in manifest")
 	}
@@ -145,34 +175,52 @@ func (parser *Parser) PullNydusBootstrap(ctx context.Context, image *Image) (io.
 	return reader, nil
 }
 
+func (parser *Parser) matchImagePlatform(desc *ocispec.Descriptor) bool {
+	if parser.interestedArch == desc.Platform.Architecture && desc.Platform.OS == "linux" {
+		return true
+	}
+	return false
+}
+
 // Parse parses Nydus image reference into Parsed object.
 func (parser *Parser) Parse(ctx context.Context) (*Parsed, error) {
-	logrus.Infof("Parsing image %s", parser.Remote.Ref)
-
-	parsed := Parsed{}
+	parsed := Parsed{
+		Remote: parser.Remote,
+	}
 
 	imageDesc, err := parser.Remote.Resolve(ctx)
 	if err != nil {
+		if strings.Contains(err.Error(), "x509: certificate signed by unknown authority") {
+			logrus.Warningln("try to enable \"--source-insecure\" / \"--target-insecure\" option")
+		}
 		return nil, errors.Wrap(err, "resolve image")
 	}
 
 	var ociDesc *ocispec.Descriptor
 	var nydusDesc *ocispec.Descriptor
 	var onlyManifest *ocispec.Manifest
+	var ignoreArch bool
 
 	switch imageDesc.MediaType {
 	// Handle image manifest
 	case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+		// Because there is only one manifest, the source is determined,
+		// `interestedArch` does not have effect.
 		onlyManifest, err = parser.pullManifest(ctx, imageDesc)
 		if err != nil {
 			return nil, err
 		}
-		bootstrapDesc := findNydusBootstrapDesc(onlyManifest)
+
+		bootstrapDesc := FindNydusBootstrapDesc(onlyManifest)
 		if bootstrapDesc != nil {
 			nydusDesc = imageDesc
 		} else {
 			ociDesc = imageDesc
 		}
+		// For a single manifest image, we just ignore the arch, so that allowing
+		// to do a default conversion on a different arch's host, for example
+		// converting an arm64 image on an amd64 host.
+		ignoreArch = true
 
 	// Handle image manifest index
 	case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
@@ -185,30 +233,46 @@ func (parser *Parser) Parse(ctx context.Context) (*Parsed, error) {
 		for idx := range index.Manifests {
 			desc := index.Manifests[idx]
 			if desc.Platform != nil {
-				if utils.IsSupportedPlatform(desc.Platform.OS, desc.Platform.Architecture) {
-					if utils.IsNydusPlatform(desc.Platform) {
+				// Currently, parser only finds one interested image.
+				if parser.matchImagePlatform(&desc) {
+					// Nydus images before v2.3.5 used `nydus.remoteimage.v1` in `platform.os.features`.
+					// Removed in later versions; check `ArtifactType` set via `merge-platform` option.
+					if desc.ArtifactType == utils.ArtifactTypeNydusImageManifest ||
+						utils.IsNydusPlatform(desc.Platform) {
 						nydusDesc = &desc
 					} else {
-						ociDesc = &desc
+						// Need to pull manifest to find out if it is a Nydus image.
+						manifest, err := parser.pullManifest(ctx, &desc)
+						if err != nil {
+							return nil, errors.Wrap(err, "pull image manifest")
+						}
+						if bootstrapDesc := FindNydusBootstrapDesc(manifest); bootstrapDesc != nil {
+							nydusDesc = &desc
+						} else {
+							ociDesc = &desc
+						}
 					}
 				}
 			} else {
+				// FIXME: Returning the first image without platform specified is subtle.
+				// It might not violate Image spec.
 				ociDesc = &desc
+				logrus.Warnf("Will cook a image without platform, %s", ociDesc.Digest)
 			}
 		}
 	}
 
 	if ociDesc != nil {
-		parsed.OCIImage, err = parser.parseImage(ctx, ociDesc, onlyManifest)
+		parsed.OCIImage, err = parser.parseImage(ctx, ociDesc, onlyManifest, ignoreArch)
 		if err != nil {
-			return nil, errors.Wrap(err, "parse OCI image")
+			return nil, errors.Wrap(err, "Parse OCI image")
 		}
 	}
 
 	if nydusDesc != nil {
-		parsed.NydusImage, err = parser.parseImage(ctx, nydusDesc, onlyManifest)
+		parsed.NydusImage, err = parser.parseImage(ctx, nydusDesc, onlyManifest, ignoreArch)
 		if err != nil {
-			return nil, errors.Wrap(err, "parse Nydus image")
+			return nil, errors.Wrap(err, "Parse Nydus image")
 		}
 	}
 

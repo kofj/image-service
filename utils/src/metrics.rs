@@ -1,23 +1,31 @@
 // Copyright 2020 Ant Group. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
-//
-// Rafs fop stats accounting and exporting.
+
+//! Nydus error events and performance related metrics.
+//!
+//! There are several types of metrics supported:
+//! - Global error events of type [`ErrorHolder`]
+//! - Storage backend metrics of type ['BackendMetrics']
+//! - Blobcache metrics of type ['BlobcacheMetrics']
+//! - Filesystem metrics of type ['FsIoStats`], supported by Rafs in fuse/virtiofs only.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, Drop};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use serde_json::Error as SerdeError;
+use nydus_api::http::MetricsError;
 
 use crate::logger::ErrorHolder;
+use crate::InodeBitmap;
 
+/// Type of `inode`.
 pub type Inode = u64;
 
-#[derive(PartialEq, Copy)]
+/// Type of file operation statistics counter.
+#[derive(PartialEq, Copy, Clone)]
 pub enum StatsFop {
     Getattr,
     Readlink,
@@ -37,54 +45,56 @@ pub enum StatsFop {
     Max,
 }
 
-#[derive(Debug)]
-pub enum IoStatsError {
-    NoCounter,
-    Serialize(SerdeError),
-}
+type IoStatsResult<T> = Result<T, MetricsError>;
 
-type IoStatsResult<T> = Result<T, IoStatsError>;
+// Block size separated counters.
+// [0-3]: <1K;1K~;4K~;16K~;
+// [5-7]: 64K~;128K~;512K~;1M~
+const BLOCK_READ_SIZES_MAX: usize = 8;
 
-impl Clone for StatsFop {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-/// Block size separated counters.
-/// 1K; 4K; 16K; 64K, 128K, 512K, 1M
-const BLOCK_READ_COUNT_MAX: usize = 8;
-
+#[inline]
 fn request_size_index(size: usize) -> usize {
-    match size {
-        // <=1K
-        _ if size >> 10 == 0 => 0,
-        // <=4K
-        _ if size >> 12 == 0 => 1,
-        // <=16K
-        _ if size >> 14 == 0 => 2,
-        // <=64K
-        _ if size >> 16 == 0 => 3,
-        // <=128K
-        _ if size >> 17 == 0 => 4,
-        // <=512K
-        _ if size >> 19 == 0 => 5,
-        // <=1M
-        _ if size >> 20 == 0 => 6,
-        // > 1M
-        // Match `BLOCK_READ_COUNT_MAX = 8`
+    let ceil = (size >> 10).leading_zeros();
+    let shift = (std::cmp::max(ceil, 53) - 53) << 2;
+
+    (0x0112_2334_5567u64 >> shift) as usize & 0xf
+}
+
+// <=1ms, <=20ms, <=50ms, <=100ms, <=500ms, <=1s, <=2s, >2s
+const READ_LATENCY_RANGE_MAX: usize = 8;
+
+fn latency_millis_range_index(elapsed: u64) -> usize {
+    match elapsed {
+        _ if elapsed <= 1 => 0,
+        _ if elapsed <= 20 => 1,
+        _ if elapsed <= 50 => 2,
+        _ if elapsed <= 100 => 3,
+        _ if elapsed <= 500 => 4,
+        _ if elapsed <= 1000 => 5,
+        _ if elapsed <= 2000 => 6,
         _ => 7,
     }
 }
 
-/// <=200us, <=500us, <=1ms, <=20ms, <=50ms, <=100ms, <=500ms, >500ms
-const READ_LATENCY_RANGE_MAX: usize = 8;
+// <=200us, <=1ms, <=20ms, <=50ms, <=500ms, <=1s, <=2s, >2s
+fn latency_micros_range_index(elapsed: u64) -> usize {
+    match elapsed {
+        _ if elapsed <= 200 => 0,
+        _ if elapsed <= 1_000 => 1,
+        _ if elapsed <= 20_000 => 2,
+        _ if elapsed <= 50_000 => 3,
+        _ if elapsed <= 500_000 => 4,
+        _ if elapsed <= 1_000_000 => 5,
+        _ if elapsed <= 2_000_000 => 6,
+        _ => 7,
+    }
+}
 
 // Defining below global static metrics set so that a specific metrics counter can
 // be found as per the rafs backend mountpoint/id. Remind that nydusd can have
 // multiple backends mounted.
 lazy_static! {
-    static ref IOS_SET: RwLock<HashMap<String, Arc<GlobalIOStats>>> = Default::default();
+    static ref FS_METRICS: RwLock<HashMap<String, Arc<FsIoStats>>> = Default::default();
 }
 
 lazy_static! {
@@ -98,60 +108,46 @@ lazy_static! {
 
 lazy_static! {
     pub static ref ERROR_HOLDER: Arc<Mutex<ErrorHolder>> =
-        Arc::new(Mutex::new(ErrorHolder::init(500, 50 * 1024)));
+        Arc::new(Mutex::new(ErrorHolder::new(500, 50 * 1024)));
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct GlobalIOStats {
-    // Whether to enable each file accounting switch.
-    // As fop accounting might consume much memory space, it is disabled by default.
-    // But global fop accounting is always working within each Rafs.
-    files_account_enabled: AtomicBool,
-    access_pattern_enabled: AtomicBool,
-    // Given the fact that we don't have to measure latency all the time,
-    // use this to turn it off.
-    measure_latency: AtomicBool,
-    id: String,
-    // Total bytes read against the filesystem.
-    data_read: AtomicUsize,
-    // Cumulative bytes for different block size.
-    block_count_read: [AtomicUsize; BLOCK_READ_COUNT_MAX],
-    // Counters for successful various file operations.
-    fop_hits: [AtomicUsize; StatsFop::Max as usize],
-    // Counters for failed file operations.
-    fop_errors: [AtomicUsize; StatsFop::Max as usize],
-    // Cumulative latency's life cycle is equivalent to Rafs, unlike incremental
-    // latency which will be cleared each time dumped. Unit as micro-seconds.
-    //   * @total means io_stats simply adds every fop latency to the counter which is never cleared.
-    //     It is useful for other tools to calculate their metrics report.
-    fop_cumulative_latency_total: [AtomicUsize; StatsFop::Max as usize],
-    // Record how many times read latency drops to the ranges.
-    // This helps us to understand the io service time stability.
-    read_latency_dist: [AtomicIsize; READ_LATENCY_RANGE_MAX],
-    // Total number of files that are currently open.
-    nr_opens: AtomicUsize,
-    nr_max_opens: AtomicUsize,
-    // Record last rafs fop timestamp, this helps us with detecting backend hang or
-    // inside dead-lock, etc.
-    last_fop_tp: AtomicUsize,
-    // Rwlock closes the race that more than one threads are creating counters concurrently.
-    #[serde(skip_serializing, skip_deserializing)]
-    file_counters: RwLock<HashMap<Inode, Arc<InodeIOStats>>>,
-    #[serde(skip_serializing, skip_deserializing)]
-    access_patterns: RwLock<HashMap<Inode, Arc<AccessPattern>>>,
+/// Trait to manipulate per inode statistics metrics.
+pub trait InodeStatsCounter {
+    fn stats_fop_inc(&self, fop: StatsFop);
+    fn stats_fop_err_inc(&self, fop: StatsFop);
+    fn stats_cumulative(&self, fop: StatsFop, value: usize);
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct InodeIOStats {
-    // Total open number of this file.
-    nr_open: AtomicUsize,
-    nr_max_open: AtomicUsize,
-    total_fops: AtomicUsize,
-    data_read: AtomicUsize,
+/// Per inode io statistics metrics.
+#[derive(Default, Debug, Serialize)]
+pub struct InodeIoStats {
+    total_fops: BasicMetric,
+    data_read: BasicMetric,
     // Cumulative bytes for different block size.
-    block_count_read: [AtomicUsize; BLOCK_READ_COUNT_MAX],
-    fop_hits: [AtomicUsize; StatsFop::Max as usize],
-    fop_errors: [AtomicUsize; StatsFop::Max as usize],
+    block_count_read: [BasicMetric; BLOCK_READ_SIZES_MAX],
+    fop_hits: [BasicMetric; StatsFop::Max as usize],
+    fop_errors: [BasicMetric; StatsFop::Max as usize],
+}
+
+impl InodeStatsCounter for InodeIoStats {
+    fn stats_fop_inc(&self, fop: StatsFop) {
+        self.fop_hits[fop as usize].inc();
+        self.total_fops.inc();
+    }
+
+    fn stats_fop_err_inc(&self, fop: StatsFop) {
+        self.fop_errors[fop as usize].inc();
+    }
+
+    fn stats_cumulative(&self, fop: StatsFop, value: usize) {
+        if fop == StatsFop::Read {
+            self.data_read.add(value as u64);
+            // Put counters into $BLOCK_READ_COUNT_MAX catagories
+            // 1K; 4K; 16K; 64K, 128K, 512K, 1M
+            let idx = request_size_index(value);
+            self.block_count_read[idx].inc();
+        }
+    }
 }
 
 /// Records how a file is accessed.
@@ -168,104 +164,125 @@ pub struct InodeIOStats {
 ///
 #[derive(Default, Debug, Serialize)]
 pub struct AccessPattern {
-    file_path: PathBuf,
-    nr_read: AtomicUsize,
+    ino: u64,
+    nr_read: BasicMetric,
     /// In unit of seconds.
-    first_access_time: AtomicUsize,
+    first_access_time_secs: AtomicU64,
+    first_access_time_nanos: AtomicU32,
 }
 
-pub trait InodeStatsCounter {
-    fn stats_fop_inc(&self, fop: StatsFop);
-    fn stats_fop_err_inc(&self, fop: StatsFop);
-    fn stats_cumulative(&self, fop: StatsFop, value: usize);
-}
-
-impl InodeStatsCounter for InodeIOStats {
-    fn stats_fop_inc(&self, fop: StatsFop) {
-        self.fop_hits[fop as usize].fetch_add(1, Ordering::Relaxed);
-        self.total_fops.fetch_add(1, Ordering::Relaxed);
-        if fop == StatsFop::Open {
-            self.nr_open.fetch_add(1, Ordering::Relaxed);
-            // Below can't guarantee that load and store are atomic but it should be OK
-            // for debug tracing info.
-            if self.nr_open.load(Ordering::Relaxed) > self.nr_max_open.load(Ordering::Relaxed) {
-                self.nr_max_open
-                    .store(self.nr_open.load(Ordering::Relaxed), Ordering::Relaxed)
-            }
-        }
-    }
-
-    fn stats_fop_err_inc(&self, fop: StatsFop) {
-        self.fop_errors[fop as usize].fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn stats_cumulative(&self, fop: StatsFop, value: usize) {
-        if fop == StatsFop::Read {
-            self.data_read.fetch_add(value, Ordering::Relaxed);
-            // Put counters into $BLOCK_READ_COUNT_MAX catagories
-            // 1K; 4K; 16K; 64K, 128K, 512K, 1M
-            let idx = request_size_index(value);
-            self.block_count_read[idx].fetch_add(1, Ordering::Relaxed);
+impl AccessPattern {
+    fn record_access_time(&self) {
+        if self.first_access_time_secs.load(Ordering::Relaxed) == 0 {
+            let t = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap();
+            self.first_access_time_secs
+                .store(t.as_secs(), Ordering::Relaxed);
+            self.first_access_time_nanos
+                .store(t.subsec_nanos(), Ordering::Relaxed);
         }
     }
 }
 
-pub fn new(id: &str) -> Arc<GlobalIOStats> {
-    let c = Arc::new(GlobalIOStats {
-        id: id.to_string(),
-        ..Default::default()
-    });
-    IOS_SET.write().unwrap().insert(id.to_string(), c.clone());
-    c.init();
-    c
+/// Filesystem level statistics and metrics.
+///
+/// Currently only Rafs in Fuse/Virtiofs mode supports filesystem level statistics and metrics.
+#[derive(Default, Debug, Serialize)]
+pub struct FsIoStats {
+    // Whether to enable each file accounting switch.
+    // As fop accounting might consume much memory space, it is disabled by default.
+    // But global fop accounting is always working within each Rafs.
+    files_account_enabled: AtomicBool,
+    access_pattern_enabled: AtomicBool,
+    record_latest_read_files_enabled: AtomicBool,
+    // Flag to enable record operation latency.
+    measure_latency: AtomicBool,
+
+    id: String,
+    // Total number of files that are currently open.
+    nr_opens: BasicMetric,
+    // Total bytes read against the filesystem.
+    data_read: BasicMetric,
+    // Cumulative bytes for different block size.
+    block_count_read: [BasicMetric; BLOCK_READ_SIZES_MAX],
+    // Counters for successful various file operations.
+    fop_hits: [BasicMetric; StatsFop::Max as usize],
+    // Counters for failed file operations.
+    fop_errors: [BasicMetric; StatsFop::Max as usize],
+
+    // Cumulative latency's life cycle is equivalent to Rafs, unlike incremental
+    // latency which will be cleared each time dumped. Unit as micro-seconds.
+    //   * @total means io_stats simply adds every fop latency to the counter which is never cleared.
+    //     It is useful for other tools to calculate their metrics report.
+    fop_cumulative_latency_total: [BasicMetric; StatsFop::Max as usize],
+    // Record how many times read latency drops to the ranges.
+    // This helps us to understand the io service time stability.
+    read_latency_dist: [BasicMetric; READ_LATENCY_RANGE_MAX],
+
+    // Rwlock closes the race that more than one threads are creating counters concurrently.
+    #[serde(skip_serializing, skip_deserializing)]
+    file_counters: RwLock<HashMap<Inode, Arc<InodeIoStats>>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    access_patterns: RwLock<HashMap<Inode, Arc<AccessPattern>>>,
+    // record regular file read
+    #[serde(skip_serializing, skip_deserializing)]
+    recent_read_files: InodeBitmap,
 }
 
-/// <=1ms, <=20ms, <=50ms, <=100ms, <=500ms, <=1s, <=2s, >2s
-fn latency_range_index(elapsed: usize) -> usize {
-    match elapsed {
-        _ if elapsed <= 1000 => 0,
-        _ if elapsed <= 20_000 => 1,
-        _ if elapsed <= 50_000 => 2,
-        _ if elapsed <= 100_000 => 3,
-        _ if elapsed <= 500_000 => 4,
-        _ if elapsed <= 1_000_000 => 5,
-        _ if elapsed <= 2_000_000 => 6,
-        _ => 7,
+macro_rules! impl_iostat_option {
+    ($get:ident, $set:ident, $opt:ident) => {
+        #[inline]
+        fn $get(&self) -> bool {
+            self.$opt.load(Ordering::Relaxed)
+        }
+
+        #[inline]
+        pub fn $set(&self, switch: bool) {
+            self.$opt.store(switch, Ordering::Relaxed)
+        }
+    };
+}
+
+impl FsIoStats {
+    /// Create a new instance of [`FsIoStats`] for filesystem `id`.
+    pub fn new(id: &str) -> Arc<FsIoStats> {
+        let c = Arc::new(FsIoStats {
+            id: id.to_string(),
+            ..Default::default()
+        });
+        FS_METRICS
+            .write()
+            .unwrap()
+            .insert(id.to_string(), c.clone());
+        c.init();
+        c
     }
-}
 
-impl GlobalIOStats {
+    /// Initialize the [`FsIoStats`] object.
     pub fn init(&self) {
         self.files_account_enabled.store(false, Ordering::Relaxed);
         self.measure_latency.store(true, Ordering::Relaxed);
     }
 
-    fn files_enabled(&self) -> bool {
-        self.files_account_enabled.load(Ordering::Relaxed)
-    }
+    impl_iostat_option!(files_enabled, toggle_files_recording, files_account_enabled);
+    impl_iostat_option!(
+        access_pattern_enabled,
+        toggle_access_pattern,
+        access_pattern_enabled
+    );
+    impl_iostat_option!(
+        record_latest_read_files_enabled,
+        toggle_latest_read_files_recording,
+        record_latest_read_files_enabled
+    );
 
-    fn access_pattern_enabled(&self) -> bool {
-        self.access_pattern_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn toggle_files_recording(&self, switch: bool) {
-        self.files_account_enabled.store(switch, Ordering::Relaxed)
-    }
-
-    pub fn toggle_access_pattern(&self, switch: bool) {
-        self.access_pattern_enabled.store(switch, Ordering::Relaxed)
-    }
-
-    /// For now, each inode has its iostats counter regardless whether it is
-    /// enabled per rafs.
-    pub fn new_file_counter<F>(&self, ino: Inode, path_getter: F)
-    where
-        F: Fn(u64) -> PathBuf,
-    {
+    /// Prepare for recording statistics information about `ino`.
+    pub fn new_file_counter(&self, ino: Inode) {
         if self.files_enabled() {
             let mut counters = self.file_counters.write().unwrap();
             if counters.get(&ino).is_none() {
-                counters.insert(ino, Arc::new(InodeIOStats::default()));
+                counters.insert(ino, Arc::new(InodeIoStats::default()));
             }
         }
 
@@ -275,7 +292,7 @@ impl GlobalIOStats {
                 records.insert(
                     ino,
                     Arc::new(AccessPattern {
-                        file_path: path_getter(ino),
+                        ino,
                         ..Default::default()
                     }),
                 );
@@ -284,7 +301,7 @@ impl GlobalIOStats {
     }
 
     fn file_stats_update(&self, ino: Inode, fop: StatsFop, bsize: usize, success: bool) {
-        self.global_update(fop, bsize, success);
+        self.fop_update(fop, bsize, success);
 
         if self.files_enabled() {
             let counters = self.file_counters.read().unwrap();
@@ -301,63 +318,41 @@ impl GlobalIOStats {
             let records = self.access_patterns.read().unwrap();
             match records.get(&ino) {
                 Some(r) => {
-                    r.nr_read.fetch_add(1, Ordering::Relaxed);
-                    if r.first_access_time.load(Ordering::Relaxed) == 0 {
-                        // FIXME: Conversion from `u64` to `usize` on 32-bit platform
-                        // is not reliable. Fix this by using AtomicU64 instead.
-                        r.first_access_time.store(
-                            SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as usize,
-                            Ordering::Relaxed,
-                        );
-                    }
+                    r.nr_read.inc();
+                    r.record_access_time();
                 }
                 None => warn!("No pattern record for file {}", ino),
             }
         }
+
+        if self.record_latest_read_files_enabled() && fop == StatsFop::Read && success {
+            self.recent_read_files.set(ino);
+        }
     }
 
-    fn global_update(&self, fop: StatsFop, value: usize, success: bool) {
-        self.last_fop_tp.store(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as usize,
-            Ordering::Relaxed,
-        );
-
-        // We put block count into 5 catagories e.g. 1K; 4K; 16K; 64K, 128K.
+    fn fop_update(&self, fop: StatsFop, value: usize, success: bool) {
+        // Linux kernel no longer splits IO into sizes smaller than 128K.
+        // So 512K and 1M is added.
+        // We put block count into 5 catagories e.g. 1K; 4K; 16K; 64K; 128K; 512K; 1M
         if fop == StatsFop::Read {
-            match value {
-                // <=1K
-                _ if value >> 10 == 0 => self.block_count_read[0].fetch_add(1, Ordering::Relaxed),
-                // <=4K
-                _ if value >> 12 == 0 => self.block_count_read[1].fetch_add(1, Ordering::Relaxed),
-                // <=16K
-                _ if value >> 14 == 0 => self.block_count_read[2].fetch_add(1, Ordering::Relaxed),
-                // <=64K
-                _ if value >> 16 == 0 => self.block_count_read[3].fetch_add(1, Ordering::Relaxed),
-                // >64K
-                _ => self.block_count_read[4].fetch_add(1, Ordering::Relaxed),
-            };
+            let idx = request_size_index(value);
+            self.block_count_read[idx].inc()
         }
 
         if success {
-            self.fop_hits[fop as usize].fetch_add(1, Ordering::Relaxed);
+            self.fop_hits[fop as usize].inc();
             match fop {
-                StatsFop::Read => self.data_read.fetch_add(value, Ordering::Relaxed),
-                StatsFop::Open => self.nr_opens.fetch_add(1, Ordering::Relaxed),
-                StatsFop::Release => self.nr_opens.fetch_sub(1, Ordering::Relaxed),
-                _ => 0,
+                StatsFop::Read => self.data_read.add(value as u64),
+                StatsFop::Open => self.nr_opens.inc(),
+                StatsFop::Release => self.nr_opens.dec(),
+                _ => (),
             };
         } else {
-            self.fop_errors[fop as usize].fetch_add(1, Ordering::Relaxed);
+            self.fop_errors[fop as usize].inc();
         }
     }
 
-    /// Paired with `latency_end` to record elapsed time for a certain type of fop.
+    /// Mark starting of filesystem operation.
     pub fn latency_start(&self) -> Option<SystemTime> {
         if !self.measure_latency.load(Ordering::Relaxed) {
             return None;
@@ -366,30 +361,32 @@ impl GlobalIOStats {
         Some(SystemTime::now())
     }
 
+    /// Mark ending of filesystem operation and record statistics.
     pub fn latency_end(&self, start: &Option<SystemTime>, fop: StatsFop) {
         if let Some(start) = start {
             if let Ok(d) = SystemTime::elapsed(start) {
-                // Converting u128 to u64 here is safe since it's delta.
-                let elapsed = d.as_micros() as usize;
-                self.read_latency_dist[latency_range_index(elapsed)]
-                    .fetch_add(1, Ordering::Relaxed);
-                self.fop_cumulative_latency_total[fop as usize]
-                    .fetch_add(elapsed as usize, Ordering::Relaxed);
+                let elapsed = saturating_duration_micros(&d);
+                self.read_latency_dist[latency_micros_range_index(elapsed)].inc();
+                self.fop_cumulative_latency_total[fop as usize].add(elapsed);
             }
         }
     }
 
-    fn export_files_stats(&self) -> Result<String, IoStatsError> {
+    fn export_files_stats(&self) -> Result<String, MetricsError> {
         serde_json::to_string(
             self.file_counters
                 .read()
                 .expect("Not expect poisoned lock")
                 .deref(),
         )
-        .map_err(IoStatsError::Serialize)
+        .map_err(MetricsError::Serialize)
     }
 
-    fn export_files_access_patterns(&self) -> Result<String, IoStatsError> {
+    fn export_latest_read_files(&self) -> String {
+        serde_json::json!(self.recent_read_files.bitmap_to_array_and_clear()).to_string()
+    }
+
+    fn export_files_access_patterns(&self) -> Result<String, MetricsError> {
         serde_json::to_string(
             &self
                 .access_patterns
@@ -397,18 +394,19 @@ impl GlobalIOStats {
                 .expect("Not poisoned lock")
                 .deref()
                 .values()
-                .filter(|r| r.nr_read.load(Ordering::Relaxed) != 0)
+                .filter(|r| r.nr_read.count() != 0)
                 .collect::<Vec<&Arc<AccessPattern>>>(),
         )
-        .map_err(IoStatsError::Serialize)
+        .map_err(MetricsError::Serialize)
     }
 
-    fn export_global_stats(&self) -> Result<String, IoStatsError> {
-        serde_json::to_string(self).map_err(IoStatsError::Serialize)
+    fn export_fs_stats(&self) -> Result<String, MetricsError> {
+        serde_json::to_string(self).map_err(MetricsError::Serialize)
     }
 }
 
-/// If you need FOP recorder count file system operations.
+/// Guard object to record file operation metrics associated with an inode.
+///
 /// Call its `settle()` method to generate an on-stack recorder.
 /// If the operation succeeds, call `mark_success()` to change the recorder's internal state.
 /// If the operation fails, its internal state will not be changed.
@@ -419,10 +417,10 @@ pub struct FopRecorder<'a> {
     success: bool,
     // Now, the size only makes sense for `Read` FOP.
     size: usize,
-    ios: &'a GlobalIOStats,
+    ios: &'a FsIoStats,
 }
 
-impl<'a> Drop for FopRecorder<'a> {
+impl Drop for FopRecorder<'_> {
     fn drop(&mut self) {
         self.ios
             .file_stats_update(self.inode, self.fop, self.size, self.success);
@@ -430,10 +428,10 @@ impl<'a> Drop for FopRecorder<'a> {
 }
 
 impl<'a> FopRecorder<'a> {
-    pub fn settle<'b, T>(fop: StatsFop, inode: u64, ios: &'b T) -> Self
+    /// Create a guard object for filesystem operation `fop` associated with `inode`.
+    pub fn settle<T>(fop: StatsFop, inode: u64, ios: &'a T) -> Self
     where
-        T: AsRef<GlobalIOStats>,
-        'b: 'a,
+        T: AsRef<FsIoStats>,
     {
         FopRecorder {
             fop,
@@ -444,76 +442,91 @@ impl<'a> FopRecorder<'a> {
         }
     }
 
+    /// Mark operation as success.
     pub fn mark_success(&mut self, size: usize) {
         self.success = true;
         self.size = size;
     }
 }
 
-pub fn export_files_stats(name: &Option<String>) -> Result<String, IoStatsError> {
-    let ios_set = IOS_SET.read().unwrap();
+/// Export file metrics of a filesystem.
+pub fn export_files_stats(
+    name: &Option<String>,
+    latest_read_files: bool,
+) -> Result<String, MetricsError> {
+    let fs_metrics = FS_METRICS.read().unwrap();
 
     match name {
-        Some(k) => ios_set
-            .get(k)
-            .ok_or(IoStatsError::NoCounter)
-            .map(|v| v.export_files_stats())?,
+        Some(k) => fs_metrics.get(k).ok_or(MetricsError::NoCounter).map(|v| {
+            if !latest_read_files {
+                v.export_files_stats()
+            } else {
+                Ok(v.export_latest_read_files())
+            }
+        })?,
         None => {
-            if ios_set.len() == 1 {
-                if let Some(ios) = ios_set.values().next() {
-                    return ios.export_files_stats();
+            if fs_metrics.len() == 1 {
+                if let Some(ios) = fs_metrics.values().next() {
+                    return if !latest_read_files {
+                        ios.export_files_stats()
+                    } else {
+                        Ok(ios.export_latest_read_files())
+                    };
                 }
             }
-            Err(IoStatsError::NoCounter)
+            Err(MetricsError::NoCounter)
         }
     }
 }
 
-pub fn export_files_access_pattern(name: &Option<String>) -> Result<String, IoStatsError> {
-    let ios_set = IOS_SET.read().unwrap();
+/// Export file access pattern of a filesystem.
+pub fn export_files_access_pattern(name: &Option<String>) -> Result<String, MetricsError> {
+    let fs_metrics = FS_METRICS.read().unwrap();
     match name {
-        Some(k) => ios_set
+        Some(k) => fs_metrics
             .get(k)
-            .ok_or(IoStatsError::NoCounter)
+            .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_files_access_patterns())?,
         None => {
-            if ios_set.len() == 1 {
-                if let Some(ios) = ios_set.values().next() {
+            if fs_metrics.len() == 1 {
+                if let Some(ios) = fs_metrics.values().next() {
                     return ios.export_files_access_patterns();
                 }
             }
-            Err(IoStatsError::NoCounter)
+            Err(MetricsError::NoCounter)
         }
     }
 }
 
-pub fn export_global_stats(name: &Option<String>) -> Result<String, IoStatsError> {
+/// Export filesystem metrics.
+pub fn export_global_stats(name: &Option<String>) -> Result<String, MetricsError> {
     // With only one rafs instance, we allow caller to ask for an unknown ios name.
-    let ios_set = IOS_SET.read().unwrap();
+    let fs_metrics = FS_METRICS.read().unwrap();
 
     match name {
-        Some(k) => ios_set
+        Some(k) => fs_metrics
             .get(k)
-            .ok_or(IoStatsError::NoCounter)
-            .map(|v| v.export_global_stats())?,
+            .ok_or(MetricsError::NoCounter)
+            .map(|v| v.export_fs_stats())?,
         None => {
-            if ios_set.len() == 1 {
-                if let Some(ios) = ios_set.values().next() {
-                    return ios.export_global_stats();
+            if fs_metrics.len() == 1 {
+                if let Some(ios) = fs_metrics.values().next() {
+                    return ios.export_fs_stats();
                 }
             }
-            Err(IoStatsError::NoCounter)
+            Err(MetricsError::NoCounter)
         }
     }
 }
 
+/// Export storage backend metrics.
 pub fn export_backend_metrics(name: &Option<String>) -> IoStatsResult<String> {
     let metrics = BACKEND_METRICS.read().unwrap();
 
     match name {
         Some(k) => metrics
             .get(k)
-            .ok_or(IoStatsError::NoCounter)
+            .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_metrics())?,
         None => {
             if metrics.len() == 1 {
@@ -521,18 +534,19 @@ pub fn export_backend_metrics(name: &Option<String>) -> IoStatsResult<String> {
                     return m.export_metrics();
                 }
             }
-            Err(IoStatsError::NoCounter)
+            Err(MetricsError::NoCounter)
         }
     }
 }
 
+/// Export blob cache metircs.
 pub fn export_blobcache_metrics(id: &Option<String>) -> IoStatsResult<String> {
     let metrics = BLOBCACHE_METRICS.read().unwrap();
 
     match id {
         Some(k) => metrics
             .get(k)
-            .ok_or(IoStatsError::NoCounter)
+            .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_metrics())?,
         None => {
             if metrics.len() == 1 {
@@ -540,72 +554,82 @@ pub fn export_blobcache_metrics(id: &Option<String>) -> IoStatsResult<String> {
                     return m.export_metrics();
                 }
             }
-            Err(IoStatsError::NoCounter)
+            Err(MetricsError::NoCounter)
         }
     }
 }
 
+/// Export global error events.
 pub fn export_events() -> IoStatsResult<String> {
-    serde_json::to_string(ERROR_HOLDER.lock().unwrap().deref()).map_err(IoStatsError::Serialize)
+    serde_json::to_string(ERROR_HOLDER.lock().unwrap().deref()).map_err(MetricsError::Serialize)
 }
 
+/// Trait to manipulate metric counters.
 pub trait Metric {
     /// Adds `value` to the current counter.
-    fn add(&self, value: usize);
+    fn add(&self, value: u64);
     /// Increments by 1 unit the current counter.
     fn inc(&self) {
         self.add(1);
     }
     /// Returns current value of the counter.
-    fn count(&self) -> usize;
+    fn count(&self) -> u64;
+    /// Subtract `value` from the current counter.
+    fn sub(&self, value: u64);
+    /// Decrease the current counter.
+    fn dec(&self) {
+        self.sub(1);
+    }
+
+    fn set(&self, value: u64);
 }
 
+/// Basic 64-bit metric counter.
 #[derive(Default, Serialize, Debug)]
-pub struct BasicMetric(AtomicUsize);
+pub struct BasicMetric(AtomicU64);
 
-/*
-Exported backend metrics look like:
-```json
-{'read_count': 901, 'read_errors': 0, 'read_amount_total': 28650387, 'read_cumulative_latency_total': 4776473,
-'read_latency_dist':   [[0, 0, 0, 72, 1, 0, 0, 0],
-                        [0, 0, 0, 203, 1, 1, 0, 0],
-                        [0, 0, 0, 545, 3, 1, 0, 0],
-                        [0, 0, 0, 10, 0, 0, 0, 0],
-                        [0, 0, 0, 45, 0, 0, 0, 0],
-                        [0, 0, 0, 0, 0, 0, 0, 0],
-                        [0, 0, 0, 0, 2, 0, 0, 0],
-                        [0, 0, 0, 0, 17, 0, 0, 0]]
+impl Metric for BasicMetric {
+    fn add(&self, value: u64) {
+        self.0.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn sub(&self, value: u64) {
+        self.0.fetch_sub(value, Ordering::Relaxed);
+    }
+
+    fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
 }
-*/
+
+/// Metrics for storage backends.
 #[derive(Default, Serialize, Debug)]
 pub struct BackendMetrics {
     #[serde(skip_serializing, skip_deserializing)]
     id: String,
-    // TODO: Turn this into enum?
+    // type of storage backend.
     backend_type: String,
     // Cumulative count of read request to backend
     read_count: BasicMetric,
     // Cumulative count of read failure to backend
     read_errors: BasicMetric,
-    // Cumulative amount of data from to backend in unit of Bytes. External tools
-    // is responsible for calculating BPS from this field.
+    // Cumulative amount of data from to backend in unit of Byte. External tools
+    // are responsible for calculating BPS from this field.
     read_amount_total: BasicMetric,
-    read_cumulative_latency_total: BasicMetric,
+    // In unit of millisecond
+    read_cumulative_latency_millis_total: BasicMetric,
+    read_cumulative_latency_millis_dist: [BasicMetric; BLOCK_READ_SIZES_MAX],
+    read_count_block_size_dist: [BasicMetric; BLOCK_READ_SIZES_MAX],
     // Categorize metrics as per their latency and request size
-    read_latency_dist: [[BasicMetric; READ_LATENCY_RANGE_MAX]; BLOCK_READ_COUNT_MAX],
-}
-
-impl Metric for BasicMetric {
-    fn add(&self, value: usize) {
-        self.0.fetch_add(value, Ordering::Relaxed);
-    }
-
-    fn count(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
+    read_latency_sizes_dist: [[BasicMetric; READ_LATENCY_RANGE_MAX]; BLOCK_READ_SIZES_MAX],
 }
 
 impl BackendMetrics {
+    /// Create a [`BackendMetrics`] object for a storage backend.
     pub fn new(id: &str, backend_type: &str) -> Arc<Self> {
         let backend_metrics = Arc::new(Self {
             id: id.to_string(),
@@ -621,40 +645,66 @@ impl BackendMetrics {
         backend_metrics
     }
 
+    /// Release a [`BackendMetrics`] object for a storage backend.
     pub fn release(&self) -> IoStatsResult<()> {
         BACKEND_METRICS
             .write()
             .unwrap()
             .remove(&self.id)
             .map(|_| ())
-            .ok_or(IoStatsError::NoCounter)
+            .ok_or(MetricsError::NoCounter)
     }
 
+    /// Mark starting of an IO operations.
     pub fn begin(&self) -> SystemTime {
         SystemTime::now()
     }
 
+    /// Mark ending of an IO operations.
     pub fn end(&self, begin: &SystemTime, size: usize, error: bool) {
         if let Ok(d) = SystemTime::elapsed(begin) {
-            // Below conversion from u128 to usize is acceptable since elapsed
-            // is a short duration.
-            let elapsed = d.as_micros() as usize;
-            self.read_count.inc();
-            self.read_cumulative_latency_total.add(elapsed);
-            self.read_amount_total.add(size);
+            let elapsed = saturating_duration_millis(&d);
 
+            self.read_count.inc();
             if error {
                 self.read_errors.inc();
             }
 
-            let lat_idx = latency_range_index(elapsed);
+            self.read_cumulative_latency_millis_total.add(elapsed);
+            self.read_amount_total.add(size as u64);
+            let lat_idx = latency_millis_range_index(elapsed);
             let size_idx = request_size_index(size);
-            self.read_latency_dist[size_idx][lat_idx].inc();
+            self.read_cumulative_latency_millis_dist[size_idx].add(elapsed);
+            self.read_count_block_size_dist[size_idx].inc();
+            self.read_latency_sizes_dist[size_idx][lat_idx].inc();
         }
     }
 
     fn export_metrics(&self) -> IoStatsResult<String> {
-        serde_json::to_string(self).map_err(IoStatsError::Serialize)
+        serde_json::to_string(self).map_err(MetricsError::Serialize)
+    }
+}
+
+// This function assumes that the counted duration won't be too long.
+fn saturating_duration_millis(d: &Duration) -> u64 {
+    let d_secs = d.as_secs();
+    if d_secs == 0 {
+        d.subsec_millis() as u64
+    } else {
+        d_secs
+            .saturating_mul(1000)
+            .saturating_add(d.subsec_millis() as u64)
+    }
+}
+
+fn saturating_duration_micros(d: &Duration) -> u64 {
+    let d_secs = d.as_secs();
+    if d_secs == 0 {
+        d.subsec_micros() as u64
+    } else {
+        d_secs
+            .saturating_mul(1_000_000)
+            .saturating_add(d.subsec_micros() as u64)
     }
 }
 
@@ -664,26 +714,48 @@ pub struct BlobcacheMetrics {
     id: String,
     // Prefer to let external tool get file's state like file size and disk usage.
     // Because stat(2) file may get blocked.
+    // It should include the real blob cache file names, so that the external GC
+    // process can handle it directly.
     pub underlying_files: Mutex<HashSet<String>>,
     pub store_path: String,
     // Cache hit percentage = (partial_hits + whole_hits) / total
     pub partial_hits: BasicMetric,
     pub whole_hits: BasicMetric,
+    // How many `read` requests are processed by the blobcache instance.
+    // This metric will be helpful when comparing with cache hits times.
     pub total: BasicMetric,
     // Scale of blobcache. Blobcache does not evict entries.
+    // Means the number of chunks in ready status.
     pub entries_count: BasicMetric,
-    // In unit of Bytes
-    pub prefetch_data_amount: BasicMetric,
-    pub prefetch_workers: AtomicUsize,
-    pub prefetch_policy: Mutex<HashSet<String>>,
     // Together with below two fields, we can figure out average merging size thus
     // to estimate the possibility to merge backend IOs.
-    pub prefetch_total_size: BasicMetric,
-    pub prefetch_mr_count: BasicMetric,
+    // In unit of Bytes
+    pub prefetch_data_amount: BasicMetric,
+    // Total prefetch requests issued from storage/blobs or rafs filesystem layer for each file that needs prefetch
+    pub prefetch_requests_count: BasicMetric,
+    pub prefetch_workers: AtomicUsize,
     pub prefetch_unmerged_chunks: BasicMetric,
+    // Cumulative time latencies of each prefetch request which can be handled in parallel.
+    // It starts when the request is born including nydusd processing and schedule and end when the chunk is downloaded and stored.
+    // Then the average prefetch latency can be calculated by
+    // `prefetch_cumulative_time_millis / prefetch_requests_count`
+    pub prefetch_cumulative_time_millis: BasicMetric,
+    // The time seconds part when nydusd begins to prefetch
+    // We can calculate prefetch average bandwidth by
+    // `prefetch_data_amount / (prefetch_end_time_secs - prefetch_begin_time_secs)`. Note, it does not take milliseconds into account yet.s
+    pub prefetch_begin_time_secs: BasicMetric,
+    // The time milliseconds part when nydusd begins to prefetch
+    pub prefetch_begin_time_millis: BasicMetric,
+    // The time seconds part when nydusd ends prefetching
+    pub prefetch_end_time_secs: BasicMetric,
+    // The time milliseconds part when nydusd ends prefetching
+    pub prefetch_end_time_millis: BasicMetric,
+    pub buffered_backend_size: BasicMetric,
+    pub data_all_ready: AtomicBool,
 }
 
 impl BlobcacheMetrics {
+    /// Create a [`BlobcacheMetrics`] object for a blob cache manager.
     pub fn new(id: &str, store_path: &str) -> Arc<Self> {
         let metrics = Arc::new(Self {
             id: id.to_string(),
@@ -691,6 +763,9 @@ impl BlobcacheMetrics {
             ..Default::default()
         });
 
+        // Old metrics will be dropped when BlobCache is swapped. So we don't
+        // have to worry about swapping its metrics either which means it's
+        // not necessary to release metrics recorder when blobcache is dropped due to swapping.
         BLOBCACHE_METRICS
             .write()
             .unwrap()
@@ -699,17 +774,31 @@ impl BlobcacheMetrics {
         metrics
     }
 
+    /// Release a [`BlobcacheMetrics`] object for a blob cache manager.
     pub fn release(&self) -> IoStatsResult<()> {
         BLOBCACHE_METRICS
             .write()
             .unwrap()
             .remove(&self.id)
             .map(|_| ())
-            .ok_or(IoStatsError::NoCounter)
+            .ok_or(MetricsError::NoCounter)
     }
 
+    /// Export blobcache metric information.
     pub fn export_metrics(&self) -> IoStatsResult<String> {
-        serde_json::to_string(self).map_err(IoStatsError::Serialize)
+        serde_json::to_string(self).map_err(MetricsError::Serialize)
+    }
+
+    pub fn calculate_prefetch_metrics(&self, begin_time: SystemTime) {
+        let now = SystemTime::now();
+        if let Ok(ref t) = now.duration_since(SystemTime::UNIX_EPOCH) {
+            self.prefetch_end_time_secs.set(t.as_secs());
+            self.prefetch_end_time_millis.set(t.subsec_millis() as u64);
+        }
+        if let Ok(ref t) = now.duration_since(begin_time) {
+            let elapsed = saturating_duration_millis(t);
+            self.prefetch_cumulative_time_millis.add(elapsed);
+        }
     }
 }
 
@@ -718,25 +807,365 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_request_size_index() {
+        assert_eq!(request_size_index(0x0), 0);
+        assert_eq!(request_size_index(0x3ff), 0);
+        assert_eq!(request_size_index(0x400), 1);
+        assert_eq!(request_size_index(0xfff), 1);
+        assert_eq!(request_size_index(0x1000), 2);
+        assert_eq!(request_size_index(0x3fff), 2);
+        assert_eq!(request_size_index(0x4000), 3);
+        assert_eq!(request_size_index(0xffff), 3);
+        assert_eq!(request_size_index(0x1_0000), 4);
+        assert_eq!(request_size_index(0x1_ffff), 4);
+        assert_eq!(request_size_index(0x2_0000), 5);
+        assert_eq!(request_size_index(0x7_ffff), 5);
+        assert_eq!(request_size_index(0x8_0000), 6);
+        assert_eq!(request_size_index(0xf_ffff), 6);
+        assert_eq!(request_size_index(0x10_0000), 7);
+        assert_eq!(request_size_index(usize::MAX), 7);
+    }
+
+    #[test]
     fn test_block_read_count() {
-        let g = GlobalIOStats::default();
+        let g = FsIoStats::default();
         g.init();
-        g.global_update(StatsFop::Read, 4000, true);
-        assert_eq!(g.block_count_read[1].load(Ordering::Relaxed), 1);
+        g.fop_update(StatsFop::Read, 4000, true);
+        assert_eq!(g.block_count_read[1].count(), 1);
 
-        g.global_update(StatsFop::Read, 4096, true);
-        assert_eq!(g.block_count_read[1].load(Ordering::Relaxed), 1);
+        g.fop_update(StatsFop::Read, 4096, true);
+        assert_eq!(g.block_count_read[2].count(), 1);
 
-        g.global_update(StatsFop::Read, 65535, true);
-        assert_eq!(g.block_count_read[3].load(Ordering::Relaxed), 1);
+        g.fop_update(StatsFop::Read, 65535, true);
+        assert_eq!(g.block_count_read[3].count(), 1);
 
-        g.global_update(StatsFop::Read, 131072, true);
-        assert_eq!(g.block_count_read[4].load(Ordering::Relaxed), 1);
+        g.fop_update(StatsFop::Read, 131072, true);
+        assert_eq!(g.block_count_read[5].count(), 1);
 
-        g.global_update(StatsFop::Read, 65520, true);
-        assert_eq!(g.block_count_read[3].load(Ordering::Relaxed), 2);
+        g.fop_update(StatsFop::Read, 65520, true);
+        assert_eq!(g.block_count_read[3].count(), 2);
 
-        g.global_update(StatsFop::Read, 2015520, true);
-        assert_eq!(g.block_count_read[3].load(Ordering::Relaxed), 2);
+        g.fop_update(StatsFop::Read, 2015520, true);
+        assert_eq!(g.block_count_read[3].count(), 2);
+    }
+
+    #[test]
+    fn test_latency_millis_range_index() {
+        assert_eq!(latency_millis_range_index(0), 0);
+        assert_eq!(latency_millis_range_index(1), 0);
+        assert_eq!(latency_millis_range_index(10), 1);
+        assert_eq!(latency_millis_range_index(20), 1);
+        assert_eq!(latency_millis_range_index(40), 2);
+        assert_eq!(latency_millis_range_index(80), 3);
+        assert_eq!(latency_millis_range_index(160), 4);
+        assert_eq!(latency_millis_range_index(320), 4);
+        assert_eq!(latency_millis_range_index(640), 5);
+        assert_eq!(latency_millis_range_index(1280), 6);
+        assert_eq!(latency_millis_range_index(2560), 7);
+    }
+
+    #[test]
+    fn test_latency_micros_range_index() {
+        assert_eq!(latency_micros_range_index(100), 0);
+        assert_eq!(latency_micros_range_index(500), 1);
+        assert_eq!(latency_micros_range_index(10_000), 2);
+        assert_eq!(latency_micros_range_index(30_000), 3);
+        assert_eq!(latency_micros_range_index(100_000), 4);
+        assert_eq!(latency_micros_range_index(1_000_000), 5);
+        assert_eq!(latency_micros_range_index(1_500_000), 6);
+        assert_eq!(latency_micros_range_index(3_000_000), 7);
+    }
+
+    #[test]
+    fn test_inode_stats() {
+        let stat = InodeIoStats::default();
+        stat.stats_fop_inc(StatsFop::Read);
+        stat.stats_fop_inc(StatsFop::Open);
+        assert_eq!(stat.fop_hits[StatsFop::Read as usize].count(), 1);
+        assert_eq!(stat.total_fops.count(), 2);
+
+        stat.stats_cumulative(StatsFop::Open, 1000);
+        stat.stats_cumulative(StatsFop::Read, 4000);
+        stat.stats_cumulative(StatsFop::Read, 5000);
+
+        assert_eq!(stat.block_count_read[0].count(), 0);
+        assert_eq!(stat.block_count_read[1].count(), 1);
+        assert_eq!(stat.block_count_read[2].count(), 1);
+    }
+
+    #[test]
+    fn test_access_pattern() {
+        let ap = AccessPattern::default();
+        ap.record_access_time();
+        assert_ne!(ap.first_access_time_secs.load(Ordering::Relaxed), 0);
+        assert_ne!(ap.first_access_time_nanos.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_file_stats_update() {
+        let f = FsIoStats::default();
+        let node1: Inode = 1;
+        let node2: Inode = 2;
+        let node3: Inode = 3;
+
+        f.new_file_counter(node1);
+        f.new_file_counter(node2);
+        assert!(f.access_patterns.read().unwrap().is_empty());
+        assert!(f.file_counters.read().unwrap().is_empty());
+
+        f.access_pattern_enabled.store(true, Ordering::Relaxed);
+        f.files_account_enabled.store(true, Ordering::Relaxed);
+        f.record_latest_read_files_enabled
+            .store(true, Ordering::Relaxed);
+        f.new_file_counter(node1);
+        f.new_file_counter(node2);
+        f.file_stats_update(node1, StatsFop::Read, 4000, true);
+        f.file_stats_update(node1, StatsFop::Read, 5000, true);
+        f.file_stats_update(node1, StatsFop::Open, 0, true);
+        f.file_stats_update(node3, StatsFop::Open, 0, true);
+        assert_eq!(
+            f.access_patterns
+                .read()
+                .unwrap()
+                .get(&node1)
+                .unwrap()
+                .nr_read
+                .count(),
+            2
+        );
+        assert_eq!(
+            f.file_counters
+                .read()
+                .unwrap()
+                .get(&node1)
+                .unwrap()
+                .fop_hits[StatsFop::Read as usize]
+                .count(),
+            2
+        );
+        assert!(f.recent_read_files.is_set(node1 as u64));
+    }
+
+    #[test]
+    fn test_fop_update() {
+        let f = FsIoStats::default();
+        assert_eq!(f.nr_opens.count(), 0);
+        f.fop_update(StatsFop::Open, 0, true);
+        assert_eq!(f.nr_opens.count(), 1);
+        f.fop_update(StatsFop::Release, 0, true);
+        assert_eq!(f.nr_opens.count(), 0);
+        f.fop_update(StatsFop::Opendir, 0, true);
+        assert_eq!(f.fop_errors[StatsFop::Opendir as usize].count(), 0);
+        f.fop_update(StatsFop::Opendir, 0, false);
+        assert_eq!(f.fop_errors[StatsFop::Opendir as usize].count(), 1);
+    }
+
+    #[test]
+    fn test_latecny() {
+        let f = FsIoStats::default();
+        assert_eq!(f.latency_start(), None);
+        f.measure_latency.store(true, Ordering::Relaxed);
+        let s = f.latency_start().unwrap();
+        let d = Duration::new(1, 500_000_000);
+        /* because of the timer resolution, the elapsed maybe greater than 1.5s gentlely*/
+        f.latency_end(&s.checked_sub(d), StatsFop::Read);
+        assert_eq!(
+            f.read_latency_dist[latency_micros_range_index(1_500_000)].count(),
+            1
+        );
+        /* we think if the latency delta error no more 1ms, the test is successful. */
+        assert!(
+            f.fop_cumulative_latency_total[StatsFop::Read as usize].count()
+                - saturating_duration_micros(&d)
+                <= 1000
+        );
+    }
+
+    #[test]
+    fn test_fs_io_stats_new_and_export() {
+        let id0: Option<String> = Some("id-0".to_string());
+        let id1: Option<String> = Some("id-1".to_string());
+        let none: Option<String> = None;
+
+        let _f1 = FsIoStats::new("id-0");
+        assert!(export_files_stats(&id0, true).is_ok());
+        assert!(export_files_stats(&none, true).is_ok());
+        assert!(export_global_stats(&id0).is_ok());
+        assert!(export_global_stats(&id1).is_err());
+        assert!(export_global_stats(&none).is_ok());
+
+        let _f2 = FsIoStats::new("id-1");
+        assert!(export_files_stats(&none, false).is_err());
+        assert!(export_files_stats(&id0, true).is_ok());
+        assert!(export_files_stats(&id0, false).is_ok());
+        assert!(export_global_stats(&none).is_err());
+        assert!(export_files_access_pattern(&id0).is_ok());
+        assert!(export_files_access_pattern(&none).is_err());
+
+        let ios = FsIoStats::default();
+        assert!(ios.export_files_access_patterns().is_ok());
+        assert!(ios.export_files_stats().is_ok());
+        assert!(ios.export_fs_stats().is_ok());
+        ios.export_latest_read_files();
+
+        test_fop_record();
+    }
+
+    fn test_fop_record() {
+        let ios = FsIoStats::new("0");
+        let mut recorder = FopRecorder::settle(StatsFop::Read, 0, &ios);
+        assert!(!recorder.success);
+        assert_eq!(recorder.size, 0);
+
+        recorder.mark_success(10);
+        assert!(recorder.success);
+        assert_eq!(recorder.size, 10);
+        drop(recorder);
+    }
+
+    #[test]
+    fn test_saturating_duration() {
+        assert_eq!(
+            saturating_duration_millis(&Duration::from_millis(1234)),
+            1234
+        );
+        assert_eq!(
+            saturating_duration_micros(&Duration::from_millis(888)),
+            888_000
+        );
+        assert_eq!(
+            saturating_duration_micros(&Duration::from_millis(1888)),
+            1_888_000
+        );
+    }
+
+    #[test]
+    fn test_blob_cache_metric() {
+        let m1: Arc<BlobcacheMetrics> = BlobcacheMetrics::new("id", "path");
+        {
+            let metrics = BLOBCACHE_METRICS.read().unwrap();
+            assert_eq!(metrics.len(), 1);
+        }
+        assert!(m1.export_metrics().is_ok());
+        assert!(m1.release().is_ok());
+        {
+            let metrics = BLOBCACHE_METRICS.read().unwrap();
+            assert_eq!(metrics.len(), 0);
+        }
+
+        let now = SystemTime::now();
+        let prev = now.checked_sub(Duration::new(10, 0)).unwrap();
+        m1.calculate_prefetch_metrics(prev);
+        assert_eq!(m1.prefetch_cumulative_time_millis.count(), 10_000);
+        assert_eq!(
+            m1.prefetch_end_time_secs.count(),
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .expect("No error")
+                .as_secs()
+        );
+
+        let id0: Option<String> = Some("id-0".to_string());
+        let none: Option<String> = None;
+        BlobcacheMetrics::new("id-0", "t0");
+        assert!(export_blobcache_metrics(&id0).is_ok());
+        assert!(export_blobcache_metrics(&none).is_ok());
+        BlobcacheMetrics::new("id-1", "t1");
+        assert!(export_blobcache_metrics(&none).is_err());
+        assert!(export_events().is_ok());
+    }
+
+    #[test]
+    fn test_backend_metric() {
+        let id0: Option<String> = Some("id-0".to_string());
+        let id1: Option<String> = Some("id-1".to_string());
+        let none: Option<String> = None;
+        let b0 = BackendMetrics::new("id-0", "t0");
+        assert!(export_backend_metrics(&id0).is_ok());
+        assert!(export_backend_metrics(&id1).is_err());
+        assert!(export_backend_metrics(&none).is_ok());
+        let b1 = BackendMetrics::new("id-1", "t1");
+        assert!(export_backend_metrics(&id0).is_ok());
+        assert!(export_backend_metrics(&id1).is_ok());
+        assert!(export_backend_metrics(&none).is_err());
+        assert!(b0.release().is_ok());
+        assert!(b1.release().is_ok());
+    }
+
+    #[test]
+    fn test_basic_metric_set_sub_dec() {
+        let m = BasicMetric::default();
+        m.add(10);
+        assert_eq!(m.count(), 10);
+        // set overwrites the current value
+        m.set(100);
+        assert_eq!(m.count(), 100);
+        // sub decrements by given amount
+        m.sub(30);
+        assert_eq!(m.count(), 70);
+        // dec decrements by 1
+        m.dec();
+        assert_eq!(m.count(), 69);
+        // inc increments by 1
+        m.inc();
+        assert_eq!(m.count(), 70);
+    }
+
+    #[test]
+    fn test_inode_stats_error_counting() {
+        let stat = InodeIoStats::default();
+        stat.stats_fop_err_inc(StatsFop::Read);
+        stat.stats_fop_err_inc(StatsFop::Read);
+        stat.stats_fop_err_inc(StatsFop::Open);
+        assert_eq!(stat.fop_errors[StatsFop::Read as usize].count(), 2);
+        assert_eq!(stat.fop_errors[StatsFop::Open as usize].count(), 1);
+        // success counters remain untouched
+        assert_eq!(stat.fop_hits[StatsFop::Read as usize].count(), 0);
+    }
+
+    #[test]
+    fn test_access_pattern_idempotency() {
+        let ap = AccessPattern::default();
+        ap.record_access_time();
+        let first_secs = ap.first_access_time_secs.load(Ordering::Relaxed);
+        let first_nanos = ap.first_access_time_nanos.load(Ordering::Relaxed);
+        assert_ne!(first_secs, 0);
+        // A second call must NOT overwrite the first timestamp.
+        ap.record_access_time();
+        assert_eq!(
+            ap.first_access_time_secs.load(Ordering::Relaxed),
+            first_secs
+        );
+        assert_eq!(
+            ap.first_access_time_nanos.load(Ordering::Relaxed),
+            first_nanos
+        );
+    }
+
+    #[test]
+    fn test_fop_recorder_failure() {
+        // Use Arc::new(default) to avoid mutating the global FS_METRICS map.
+        let ios = Arc::new(FsIoStats::default());
+        {
+            let _recorder = FopRecorder::settle(StatsFop::Read, 0, &ios);
+            // Drop without calling mark_success() → counted as failure.
+        }
+        assert_eq!(ios.fop_errors[StatsFop::Read as usize].count(), 1);
+        assert_eq!(ios.data_read.count(), 0);
+    }
+
+    #[test]
+    fn test_backend_metrics_error_flag() {
+        let backend = BackendMetrics::new("test-error-flag-backend", "test");
+        let begin = backend.begin();
+        backend.end(&begin, 4096, false);
+        assert_eq!(backend.read_count.count(), 1);
+        assert_eq!(backend.read_errors.count(), 0);
+        assert_eq!(backend.read_amount_total.count(), 4096);
+
+        let begin2 = backend.begin();
+        backend.end(&begin2, 0, true);
+        assert_eq!(backend.read_count.count(), 2);
+        assert_eq!(backend.read_errors.count(), 1);
+        assert!(backend.release().is_ok());
     }
 }

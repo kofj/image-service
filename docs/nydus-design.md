@@ -2,11 +2,11 @@
 
 # I. High Level Design
 ##    0. Overview
-Dragonfly image service is named as `nydus`, [github repo](https://github.com/dragonflyoss/image-service)
+Dragonfly image service is named as `nydus`, [GitHub repo](https://github.com/dragonflyoss/nydus)
 
 Nydus consists of two parts,
 * a userspace filesystem called `rafs` on top of a container image format
-* an image manifest that is compatible with oci spec of image and distribution
+* an image manifest that is compatible with OCI spec of image and distribution
 
 Its key features include:
 
@@ -26,13 +26,13 @@ Nydus takes in either [FUSE](https://www.kernel.org/doc/html/latest/filesystems/
 ![architecture](images/nydusd-arch.png)
 
 ##    2. Rafs
-Rafs presents to users a userspace filesystem with seperating filesystem's metadata with data.  In a typical rafs filesystem, the metadata is stored in `bootstrap` while the data is stored in `blobfile`. Nydus splits container image into two parts, metadata and data, where metadata contains everything a container needs to start with, while data is stored in chunk with chunk size being 1MB.
+Rafs is a filesystem image containing a separated metadata blob and several data-deduplicated content-addressable data blobs.  In a typical rafs filesystem, the metadata is stored in `bootstrap` while the data is stored in `blobfile`. Nydus splits container image into two parts, metadata and data, where metadata contains everything a container needs to start with, while data is stored in chunks with chunk size being 1MB. Currently, Rafs has two versions called `Rafs v5` (which is a FUSE-based filesystem) and `Rafs v6` (which is compatible with the in-kernel EROFS filesystem). Note that, the following details are all about `Rafs v5` and materials about `Rafs v6` are still working in progress.
 
 ![rafs](./images/rafs-format.png)
 
    * bootstrap
       * The metadata is a merkle tree whose nodes represents a regular filesystem's directory/file
-      * a leaf nodes refers to a file and contains hash value of its file data
+      * a leaf node refers to a file and contains hash value of its file data
       * Root node and internal nodes refer to directories and contain the hash value of their children nodes.
 ```
 +-----------------+-----------------+--------------+----------------+-------+-------+--------+---------------------+
@@ -68,7 +68,7 @@ Rafs presents to users a userspace filesystem with seperating filesystem's metad
 |            |           |                                                 |
 +------------+-----------+-------------------------------------------------+
 ```
-   
+
 ##    3. Integrity Validation
 ### 3.1 Metadata Integrity Validation
 Firstly, Nydus does basic verification of metadata values, looking for values that are in range (and hence not detected by automated verification checks) but are not correct.
@@ -79,36 +79,42 @@ Validation of the metadata takes place at runtime when metadata is accessed.  By
 
 The read verification is doing sanity checking on metadata's fields and determining whether digest validating is necessary.  If it is, the digest is calculated with the chosen hash algorithm and compared against the value stored in the object itself.  If any of these checks fail, then the buffer is considered corrupt and the EINVAL error is set appropriately.
 ### 3.2  Data Integrity Validation
-Data is split into chunks and each chunk has a saved digest in chunk info, the way of metadata digest validation applies to chunk as well.
+Data is split into chunks and each chunk has a saved digest in chunk info, the way of metadata digest validation applies to chunks as well.
 
 ##    4. Prefetch
 As a lazily fetch solution, prefetch plays an important role to mitigate the impact of failing to fetch data after containers run.   In order to do it, we need to record hints in container image about which files and directories need prefetching, according to the information, at runtime nydus daemon will fetch these files and directories in the background into local storage.
 
 The image build tool `nydusify` accepts prefetch hints from `stdin`.
 ##    5. Blob and Blob Cache
+
 * blob
+
 Blob is the data part of a container image, it consists of files' data.  Nydus has splitted a file's data into one or more fixed-length (1MB) chunks.
 
 * blob cache
+
 Nydus can be configured to set up a cache for blob, called `blobcache`.  With `blobcache`, fetched blob data is saved to a `work dir` and won't be repeatedly fetched.  Given the assumption that only a small portion of image is fetched, there is no cache eviction for `blobcache`.
 
 ##    6. Compression
 Nydus can be configured to save either compressed chunk or noncompressed chunk, with compressed chunk is the default configuration.
 
-The compression algorithm is lz4 and gzip, `None` stands for noncompression.
-```
+The compression algorithm is lz4, gzip and zstd, `None` stands for noncompression.
+
+```rust
 pub enum Algorithm {
     None,
     LZ4Block,
     GZip,
+    Zstd,
 }
 ```
 
 # II. Global Structures
    ## 1. Rafs Superblock
    Rafs superblock is located at the first 8K of  the `bootstrap` file.
-   ```
-   pub struct OndiskSuperBlock {
+
+```rust
+pub struct OndiskSuperBlock {
     /// RAFS super magic
     s_magic: u32,
     /// RAFS version
@@ -142,7 +148,8 @@ pub enum Algorithm {
 ```
 
 `s_flags` offers several flags to choose which compression algorithm, metadata hash algorithm and xattr will be used.
-```
+
+```rust
 bitflags! {
     pub struct RafsSuperFlags: u64 {
         /// Data chunks are not compressed.
@@ -163,35 +170,36 @@ bitflags! {
         const HAS_XATTR = 0x0000_0020;
         // Data chunks are compressed with gzip
         const COMPRESS_GZIP = 0x0000_0040;
+        // Data chunks are compressed with zstd
+        const COMPRESS_ZSTD = 0x0000_0080;
     }
 }
 ```
 
    ## 2. Rafs Inode
 
-   ```
-   pub struct OndiskInodeWrapper<'a> {
+```rust
+pub struct OndiskInodeWrapper<'a> {
     pub name: &'a OsStr,
     pub symlink: Option<&'a OsStr>,
     pub inode: &'a OndiskInode,
 }
-   ```
- 
+```
+
 The OndiskInode struct size is padded to 128 bytes.
-   
-* If it's a directory, all its children is indexed contiguously in `inode table`, and `i_child_index` is the index of  the first child and `i_child_count` is the amount of its children.
+
+* If it's a directory, all its children are indexed contiguously in `inode table`, and `i_child_index` is the index of the first child and `i_child_count` is the amount of its children.
 * If it's a file, `i_child_index` is not used.
 *`i_name_size` is the length of its name.
 * `i_symlink_size` is the length of its symlink path.
 
-  
-```
-   pub struct OndiskInode {
+```rust
+pub struct OndiskInode {
     /// sha256(sha256(chunk) + ...), [char; RAFS_SHA256_LENGTH]
     pub i_digest: RafsDigest, // 32
     /// parent inode number
     pub i_parent: u64,
-    /// from fs stat()
+    /// Artifact inode number set by the nydus image builder. Start from RAFS_ROOT_INODE = 1.
     pub i_ino: u64,
     pub i_uid: u32,
     pub i_gid: u32,
@@ -213,12 +221,12 @@ The OndiskInode struct size is padded to 128 bytes.
     pub i_symlink_size: u16, // 104
     pub i_reserved: [u8; 24], // 128
 }
-   ```
+```
 
 `i_flags` indicates whether the inode is a symlink or a hardlink, whether it has xattr, and whether it has hole between its chunks.
 
-  ```
-  bitflags! {
+```rust
+bitflags! {
     pub struct RafsInodeFlags: u64 {
         /// Inode is a symlink.
         const SYMLINK = 0x0000_0001;
@@ -228,16 +236,19 @@ The OndiskInode struct size is padded to 128 bytes.
         const XATTR = 0x0000_0004;
         /// Inode chunks has holes.
         const HAS_HOLE = 0x0000_0008;
-   }
+    }
 }
-  ```
-  `OndiskXAttrs` and xattr are stored right after `OndiskInodeWrapper` in the boostrap file.
- ```
- pub struct OndiskXAttrs {
+```
+
+  `OndiskXAttrs` and xattr are stored right after `OndiskInodeWrapper` in the bootstrap file.
+
+```rust
+pub struct OndiskXAttrs {
     pub size: u64,
 }
- ```
-A list of `OndiskChunkInfo` is also stored after xattr if the inode contains file data.  Each chunk info tells us where to find data in blob file, it contains 
+```
+
+A list of `OndiskChunkInfo` is also stored after xattr if the inode contains file data.  Each chunk info tells us where to find data in blob file, it contains
 - the hash value `block_id` calculated from the chunk data,
 - the blob file it belongs to,
 - whether the chunk is compressed,
@@ -246,8 +257,8 @@ A list of `OndiskChunkInfo` is also stored after xattr if the inode contains fil
 - the file offset.
 
 
-```
-  pub struct OndiskChunkInfo {
+```rust
+pub struct OndiskChunkInfo {
     /// sha256(chunk), [char; RAFS_SHA256_LENGTH]
     pub block_id: RafsDigest,
     /// blob index (blob_id = blob_table[blob_index])
@@ -277,26 +288,28 @@ bitflags! {
         const HOLECHUNK = 0x0000_0002;
     }
 }
-  ```
-  
+```
    ## 3. Rafs Inode Table
 Inode table is a mapping from inode index to `OndiskInode`, specifically a hardlink file shares the same inode number but has a different inode index.
-```
-   pub struct OndiskInodeTable {
+
+```rust
+pub struct OndiskInodeTable {
     pub(crate) data: Vec<u32>,
 }
-   ```
+```
    ## 4. Rafs Prefetch Table
   This is where we record hints in container image about which files and directories need prefetching upon starting.
-```
+
+```rust
 pub struct PrefetchTable {
     pub inode_indexes: Vec<u32>,
 }
-   ```
+```
    ## 5. Rafs Blob Table
    Blob table is the mapping from blob index of `OndiskInode` to blob id so that we don't have to record blob id inside `OndiskInode` (note that different inodes' data chunk can reside in the same blob).
-```
-   pub struct OndiskBlobTableEntry {
+
+```rust
+pub struct OndiskBlobTableEntry {
     pub readahead_offset: u32,
     pub readahead_size: u32,
     pub blob_id: String,
@@ -305,14 +318,15 @@ pub struct PrefetchTable {
 pub struct OndiskBlobTable {
     pub entries: Vec<OndiskBlobTableEntry>,
 }
-   ```
+```
 # III. Manifest of Nydus Format Image
 Nydus manifest is designed to be fully compatible with OCI image spec and distribution spec by adding an extra manifest file to store the pointers of nydus bootstrap (i.e. metadata) and blobfile (i.e. data).
 
-  ## 1. Image Index
-  A typical image index enabling nydus points to two manifest files, one is the traditional OCIv1 image manifest, the other is the nydus manifest that takes advantage of `platform` and puts `os.features: ["nydus.remoteimage.v1"]` field under `platform`.
-  ```
-  {
+## 1. Image Index
+A typical image index enabling nydus points to two manifest files, one is the traditional OCI v1 image manifest, the other is the nydus manifest that takes advantage of `artifactType` and puts `application/vnd.nydus.image.manifest.v1+json` as a value to identify the nydus image.
+
+```json
+{
   "schemaVersion": 2,
   "manifests": [
     {
@@ -330,26 +344,29 @@ Nydus manifest is designed to be fully compatible with OCI image spec and distri
       "digest": "sha256:9e2bcf20f78c9ca1a5968a9228d73d85f27846904ddd9f6c10ef2263e13cec4f",
       "platform": {
         "architecture": "amd64",
-        "os": "linux",
-        "os.features": [
-          "nydus.remoteimage.v1"
-        ]
-      }
+        "os": "linux"
+      },
+      "artifactType": "application/vnd.nydus.image.manifest.v1+json"
     }
   ]
 }
-  ```
-  ## 2. Image Manifest
-  A typical image manifest of nydus consists of `config.json`, one nydus metadata layer (`"mediaType": "application/vnd.oci.image.layer.v1.tar.gz"`) and one or more nydus data layers (`"mediaType": "application/vnd.oci.image.layer.nydus.blob.v1"`).
-  * nydus metadata layer
-  This layer refers to the metadata part of files and directories in the image, including rafs filesystem metadata and digest for validation purpose.
-  The special part is that an annotation `"containerd.io/snapshot/nydus-bootstrap": "true"` is set and lets containerd's snapshotter know it's nydus metadata layer and do its job accordingly.
-  * nydus data layer
-  This layer refers to the data part, please note that the data layers of an image can be owned solely by this image or shared by others, similarly, each data layer is annotated with `"containerd.io/snapshot/nydus-blob": "true"`, which can be used to tell containerd's snapshotter to skip downloading them.
-  
-  The manifest is designed to be compatible with the dependency architect and garbage collection algorithm widely used by containerd and registry.
-  ```
-  {
+```
+## 2. Image Manifest
+
+A typical image manifest of nydus consists of `config.json`, one nydus metadata layer (`"mediaType": "application/vnd.oci.image.layer.v1.tar.gz"`) and one or more nydus data layers (`"mediaType": "application/vnd.oci.image.layer.nydus.blob.v1"`).
+
+* nydus metadata layer
+
+This layer refers to the metadata part of files and directories in the image, including rafs filesystem metadata and digest for validation purpose.
+
+* nydus data layer
+
+This layer refers to the data part, please note that the data layers of an image can be owned solely by this image or shared by others, similarly, each data layer is annotated with `"containerd.io/snapshot/nydus-blob": "true"`, which can be used to tell containerd's snapshotter to skip downloading them.
+
+The manifest is designed to be compatible with the dependency architect and garbage collection algorithm widely used by containerd and registry.
+
+```json
+{
   "schemaVersion": 2,
   "mediaType": "",
   "config": {
@@ -392,4 +409,4 @@ Nydus manifest is designed to be fully compatible with OCI image spec and distri
     }
   ]
 }
-  ```
+```

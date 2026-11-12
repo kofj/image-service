@@ -7,36 +7,44 @@ package backend
 import (
 	"context"
 	"fmt"
+	"io"
 
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/remote"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/utils"
+	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/remote"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
-// Backend transers artifacts generated during image conversion to a backend storage such as:
-//		1. registry: complying to OCI distribution specification, push blob file
-//		   to registry and use the registry as a storage.
-//		2. oss: A object storage backend, which uses its SDK to transer blob file.
+// Backend transfers artifacts generated during image conversion to a backend storage such as:
+// 1. registry: complying to OCI distribution specification, push blob file
+// to registry and use the registry as a storage.
+// 2. oss: A object storage backend, which uses its SDK to transfer blob file.
 type Backend interface {
 	// TODO: Hopefully, we can pass `Layer` struct in, thus to be able to cook both
 	// file handle and file path.
-	Upload(ctx context.Context, blobID, blobPath string, blobSize int64) (*ocispec.Descriptor, error)
+	Upload(ctx context.Context, blobID, blobPath string, blobSize int64, forcePush bool) (*ocispec.Descriptor, error)
+	Finalize(cancel bool) error
 	Check(blobID string) (bool, error)
-	Type() BackendType
+	Type() Type
+	Reader(blobID string) (io.ReadCloser, error)
+	RangeReader(blobID string) (remotes.RangeReadCloser, error)
+	Size(blobID string) (int64, error)
 }
 
 // TODO: Directly forward blob data to storage backend
 
-type BackendType = int
+type Type = int
 
 const (
-	OssBackend BackendType = iota
+	OssBackend Type = iota
 	RegistryBackend
+	S3backend
 )
 
-func blobDesc(size int64, blobId string) ocispec.Descriptor {
-	blobDigest := digest.NewDigestFromEncoded(digest.SHA256, blobId)
+func blobDesc(size int64, blobID string) ocispec.Descriptor {
+	blobDigest := digest.NewDigestFromEncoded(digest.SHA256, blobID)
 	desc := ocispec.Descriptor{
 		Digest:    blobDigest,
 		Size:      size,
@@ -65,6 +73,8 @@ func NewBackend(bt string, config []byte, remote *remote.Remote) (Backend, error
 		return newOSSBackend(config)
 	case "registry":
 		return newRegistryBackend(config, remote)
+	case "s3":
+		return newS3Backend(config)
 	default:
 		return nil, fmt.Errorf("unsupported backend type %s", bt)
 	}

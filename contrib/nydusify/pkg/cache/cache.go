@@ -10,26 +10,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strconv"
 
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/backend"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/remote"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/utils"
-
-	"github.com/containerd/containerd/images"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/backend"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/remote"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
 // Opt configures Nydus cache
 type Opt struct {
 	// Maximum records(bootstrap layer + blob layer) in cache image.
 	MaxRecords uint
+	// Version of cache image, we need to discard cache layers when
+	// the required version (specified by `--build-cache-version`)
+	// is unmatched with the cache image version, for example nydus
+	// bootstrap format has a minor upgrade.
+	Version string
+	// Bootstrap's RAFS version of cache image, we need to discard cache
+	// layers when the required version (specified by `--fs-version`) is
+	// unmatched with the fs version recorded in cache image, for example
+	// we can't use rafs v5 cache layers for rafs v6 image.
+	FsVersion string
 	// Make cache image manifest compatible with the docker v2 media
-	// type defined in github.com/containerd/containerd/images.
+	// type defined in github.com/containerd/containerd/v2/core/images.
 	DockerV2Format bool
 	// The blob layer record will not be written to cache image if
 	// the backend be specified, because the blob layer will be uploaded
@@ -47,16 +57,18 @@ type Opt struct {
 // Here is the build cache workflow:
 // 1. Import cache records from registry;
 // 2. Check cache record using source layer ChainID before layer build,
-//    skip layer build if the cache hit;
+// skip layer build if the cache hit;
 // 3. Export new cache records to registry;
 type Cache struct {
 	opt Opt
 	// Remote is responsible for pulling & pushing cache image
 	remote *remote.Remote
-	// Store the pulled records from registry
-	pulledRecords map[digest.Digest]*CacheRecord
-	// Store the records prepared to push to registry
-	pushedRecords []*CacheRecord
+	// Records referenced
+	referenceRecords map[digest.Digest]*Record
+	// Records pulled from registry
+	pulledRecords map[digest.Digest]*Record
+	// Records to be push to registry
+	pushedRecords []*Record
 }
 
 // New creates Nydus cache instance,
@@ -65,29 +77,75 @@ func New(remote *remote.Remote, opt Opt) (*Cache, error) {
 		opt:    opt,
 		remote: remote,
 		// source_layer_chain_id -> cache_record
-		pulledRecords: make(map[digest.Digest]*CacheRecord),
-		pushedRecords: []*CacheRecord{},
+		pulledRecords:    make(map[digest.Digest]*Record),
+		referenceRecords: make(map[digest.Digest]*Record),
+		pushedRecords:    []*Record{},
 	}
 
 	return cache, nil
 }
 
-func (cache *Cache) recordToLayer(record *CacheRecord) (*ocispec.Descriptor, *ocispec.Descriptor) {
+func (cacheRecord *Record) GetReferenceBlobs() []string {
+	listStr := cacheRecord.NydusBootstrapDesc.Annotations[utils.LayerAnnotationNydusReferenceBlobIDs]
+	if listStr == "" {
+		return []string{}
+	}
+	var blobs []string
+	if err := json.Unmarshal([]byte(listStr), &blobs); err != nil {
+		return []string{}
+	}
+	return blobs
+}
+
+func (cache *Cache) GetReference(d digest.Digest) *Record {
+	r, ok := cache.referenceRecords[d]
+	if !ok {
+		return nil
+	}
+	return r
+}
+
+func (cache *Cache) SetReference(layer *ocispec.Descriptor) {
+	record := cache.layerToRecord(layer)
+	cache.referenceRecords[layer.Digest] = record
+}
+
+func (cache *Cache) recordToLayer(record *Record) (*ocispec.Descriptor, *ocispec.Descriptor) {
+	// Handle referenced nydus data blob
+	if record.SourceChainID == "" {
+		if record.NydusBlobDesc != nil {
+			if cache.opt.Backend.Type() == backend.RegistryBackend {
+				return nil, &ocispec.Descriptor{
+					MediaType: utils.MediaTypeNydusBlob,
+					Digest:    record.NydusBlobDesc.Digest,
+					Size:      record.NydusBlobDesc.Size,
+					Annotations: map[string]string{
+						utils.LayerAnnotationNydusBlob: "true",
+					},
+				}
+			}
+		}
+		return nil, nil
+	}
+
 	bootstrapCacheMediaType := ocispec.MediaTypeImageLayerGzip
 	if cache.opt.DockerV2Format {
 		bootstrapCacheMediaType = images.MediaTypeDockerSchema2LayerGzip
 	}
-
 	bootstrapCacheDesc := &ocispec.Descriptor{
 		MediaType: bootstrapCacheMediaType,
 		Digest:    record.NydusBootstrapDesc.Digest,
 		Size:      record.NydusBootstrapDesc.Size,
 		Annotations: map[string]string{
 			utils.LayerAnnotationNydusBootstrap:     "true",
+			utils.LayerAnnotationNydusFsVersion:     cache.opt.FsVersion,
 			utils.LayerAnnotationNydusSourceChainID: record.SourceChainID.String(),
 			// Use the annotation to record bootstrap layer DiffID.
 			utils.LayerAnnotationUncompressed: record.NydusBootstrapDiffID.String(),
 		},
+	}
+	if referenceBlobsStr, ok := record.NydusBootstrapDesc.Annotations[utils.LayerAnnotationNydusReferenceBlobIDs]; ok {
+		bootstrapCacheDesc.Annotations[utils.LayerAnnotationNydusReferenceBlobIDs] = referenceBlobsStr
 	}
 
 	var blobCacheDesc *ocispec.Descriptor
@@ -114,9 +172,22 @@ func (cache *Cache) recordToLayer(record *CacheRecord) (*ocispec.Descriptor, *oc
 }
 
 func (cache *Cache) exportRecordsToLayers() []ocispec.Descriptor {
-	layers := []ocispec.Descriptor{}
+	var (
+		layers          []ocispec.Descriptor
+		referenceLayers []ocispec.Descriptor
+	)
 
 	for _, record := range cache.pushedRecords {
+		referenceBlobIDs := record.GetReferenceBlobs()
+		for _, blobID := range referenceBlobIDs {
+			// for oss backend, GetReference always return nil
+			// for registry backend, GetReference should not return nil
+			referenceRecord := cache.GetReference(digest.NewDigestFromEncoded(digest.SHA256, blobID))
+			if referenceRecord != nil {
+				_, blobDesc := cache.recordToLayer(referenceRecord)
+				referenceLayers = append(referenceLayers, *blobDesc)
+			}
+		}
 		bootstrapCacheDesc, blobCacheDesc := cache.recordToLayer(record)
 		layers = append(layers, *bootstrapCacheDesc)
 		if blobCacheDesc != nil {
@@ -124,12 +195,25 @@ func (cache *Cache) exportRecordsToLayers() []ocispec.Descriptor {
 		}
 	}
 
-	return layers
+	return append(referenceLayers, layers...)
 }
 
-func (cache *Cache) layerToRecord(layer *ocispec.Descriptor) *CacheRecord {
+func (cache *Cache) layerToRecord(layer *ocispec.Descriptor) *Record {
 	sourceChainIDStr, ok := layer.Annotations[utils.LayerAnnotationNydusSourceChainID]
 	if !ok {
+		if layer.Annotations[utils.LayerAnnotationNydusBlob] == "true" {
+			// for reference blob layers
+			return &Record{
+				NydusBlobDesc: &ocispec.Descriptor{
+					MediaType: layer.MediaType,
+					Digest:    layer.Digest,
+					Size:      layer.Size,
+					Annotations: map[string]string{
+						utils.LayerAnnotationNydusBlob: "true",
+					},
+				},
+			}
+		}
 		return nil
 	}
 	sourceChainID := digest.Digest(sourceChainIDStr)
@@ -156,8 +240,13 @@ func (cache *Cache) layerToRecord(layer *ocispec.Descriptor) *CacheRecord {
 			Size:      layer.Size,
 			Annotations: map[string]string{
 				utils.LayerAnnotationNydusBootstrap: "true",
+				utils.LayerAnnotationNydusFsVersion: cache.opt.FsVersion,
 				utils.LayerAnnotationUncompressed:   uncompressedDigestStr,
 			},
+		}
+		referenceBlobsStr := layer.Annotations[utils.LayerAnnotationNydusReferenceBlobIDs]
+		if referenceBlobsStr != "" {
+			bootstrapDesc.Annotations[utils.LayerAnnotationNydusReferenceBlobIDs] = referenceBlobsStr
 		}
 		var nydusBlobDesc *ocispec.Descriptor
 		if layer.Annotations[utils.LayerAnnotationNydusBlobDigest] != "" &&
@@ -179,7 +268,7 @@ func (cache *Cache) layerToRecord(layer *ocispec.Descriptor) *CacheRecord {
 				},
 			}
 		}
-		return &CacheRecord{
+		return &Record{
 			SourceChainID:        sourceChainID,
 			NydusBootstrapDesc:   &bootstrapDesc,
 			NydusBlobDesc:        nydusBlobDesc,
@@ -197,7 +286,7 @@ func (cache *Cache) layerToRecord(layer *ocispec.Descriptor) *CacheRecord {
 				utils.LayerAnnotationNydusBlob: "true",
 			},
 		}
-		return &CacheRecord{
+		return &Record{
 			SourceChainID: sourceChainID,
 			NydusBlobDesc: nydusBlobDesc,
 		}
@@ -206,44 +295,53 @@ func (cache *Cache) layerToRecord(layer *ocispec.Descriptor) *CacheRecord {
 	return nil
 }
 
-func mergeRecord(old, new *CacheRecord) *CacheRecord {
-	if old == nil {
-		old = &CacheRecord{
-			SourceChainID: new.SourceChainID,
+func mergeRecord(oldRec, newRec *Record) *Record {
+	if oldRec == nil {
+		oldRec = &Record{
+			SourceChainID: newRec.SourceChainID,
 		}
 	}
 
-	if new.NydusBootstrapDesc != nil {
-		old.NydusBootstrapDesc = new.NydusBootstrapDesc
-		old.NydusBootstrapDiffID = new.NydusBootstrapDiffID
+	if newRec.NydusBootstrapDesc != nil {
+		oldRec.NydusBootstrapDesc = newRec.NydusBootstrapDesc
+		oldRec.NydusBootstrapDiffID = newRec.NydusBootstrapDiffID
 	}
 
-	if new.NydusBlobDesc != nil {
-		old.NydusBlobDesc = new.NydusBlobDesc
+	if newRec.NydusBlobDesc != nil {
+		oldRec.NydusBlobDesc = newRec.NydusBlobDesc
 	}
 
-	return old
+	return oldRec
 }
 
-func (cache *Cache) importLayersToRecords(layers []ocispec.Descriptor) {
-	pulledRecords := make(map[digest.Digest]*CacheRecord)
-	pushedRecords := []*CacheRecord{}
+func (cache *Cache) importRecordsFromLayers(layers []ocispec.Descriptor) {
+	pulledRecords := make(map[digest.Digest]*Record)
+	referenceRecords := make(map[digest.Digest]*Record)
+	pushedRecords := []*Record{}
 
-	for idx := range layers {
-		record := cache.layerToRecord(&layers[idx])
+	for _, layer := range layers {
+		record := cache.layerToRecord(&layer)
 		if record != nil {
-			// Merge bootstrap and related blob layer to record
-			newRecord := mergeRecord(
-				pulledRecords[record.SourceChainID],
-				record,
-			)
-			pulledRecords[record.SourceChainID] = newRecord
-			pushedRecords = append(pushedRecords, newRecord)
+			if record.SourceChainID == "" {
+				referenceRecords[record.NydusBlobDesc.Digest] = record
+				logrus.Infof("Found reference blob layer %s", record.NydusBlobDesc.Digest)
+			} else {
+				// Merge bootstrap and related blob layer to record
+				newRecord := mergeRecord(
+					pulledRecords[record.SourceChainID],
+					record,
+				)
+				pulledRecords[record.SourceChainID] = newRecord
+				pushedRecords = append(pushedRecords, newRecord)
+			}
+		} else {
+			logrus.Warnf("Strange! Build cache layer can't produce a valid record. %s", layer.Digest)
 		}
 	}
 
 	cache.pulledRecords = pulledRecords
 	cache.pushedRecords = pushedRecords
+	cache.referenceRecords = referenceRecords
 }
 
 // Export pushes cache manifest index to remote registry
@@ -254,6 +352,28 @@ func (cache *Cache) Export(ctx context.Context) error {
 
 	layers := cache.exportRecordsToLayers()
 
+	// Ensure layers from manifest match with image config,
+	// this will keep compatibility when using docker pull
+	// for the image that only included bootstrap layers.
+	diffIDs := []digest.Digest{}
+	for _, layer := range layers {
+		var diffID digest.Digest
+		if layer.MediaType == utils.MediaTypeNydusBlob {
+			diffID = layer.Digest
+		} else {
+			diffID = digest.Digest(layer.Annotations[utils.LayerAnnotationUncompressed])
+		}
+		if diffID.Validate() == nil {
+			diffIDs = append(diffIDs, diffID)
+		} else {
+			logrus.Warn("Drop the entire diff id list due to an invalid diff id")
+			diffIDs = []digest.Digest{}
+			// It is possible that some existing cache images don't have diff ids,
+			// but we can't break the cache export, so just break the loop.
+			break
+		}
+	}
+
 	// Prepare empty image config, just for registry API compatibility,
 	// manifest requires a valid config field.
 	configMediaType := ocispec.MediaTypeImageConfig
@@ -262,7 +382,11 @@ func (cache *Cache) Export(ctx context.Context) error {
 	}
 	config := ocispec.Image{
 		Config: ocispec.ImageConfig{},
-		RootFS: ocispec.RootFS{},
+		RootFS: ocispec.RootFS{
+			Type: "layers",
+			// Layers from manifest must be match image config.
+			DiffIDs: diffIDs,
+		},
 	}
 	configDesc, configBytes, err := utils.MarshalToDesc(config, configMediaType)
 	if err != nil {
@@ -278,7 +402,7 @@ func (cache *Cache) Export(ctx context.Context) error {
 		mediaType = images.MediaTypeDockerSchema2Manifest
 	}
 
-	manifest := CacheManifest{
+	manifest := Manifest{
 		MediaType: mediaType,
 		Manifest: ocispec.Manifest{
 			Versioned: specs.Versioned{
@@ -289,7 +413,8 @@ func (cache *Cache) Export(ctx context.Context) error {
 			Config: *configDesc,
 			Layers: layers,
 			Annotations: map[string]string{
-				utils.ManifestNydusCache: utils.ManifestNydusCacheVersion,
+				utils.ManifestNydusCache:            cache.opt.Version,
+				utils.LayerAnnotationNydusFsVersion: cache.opt.FsVersion,
 			},
 		},
 	}
@@ -320,28 +445,42 @@ func (cache *Cache) Import(ctx context.Context) error {
 	}
 	defer manifestReader.Close()
 
-	manifestBytes, err := ioutil.ReadAll(manifestReader)
+	manifestBytes, err := io.ReadAll(manifestReader)
 	if err != nil {
 		return errors.Wrap(err, "Read cache manifest")
 	}
 
-	var manifest CacheManifest
+	var manifest Manifest
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 		return errors.Wrap(err, "Unmarshal cache manifest")
 	}
 
-	// Discard the cache mismatched version
-	if manifest.Annotations[utils.ManifestNydusCache] != utils.ManifestNydusCacheVersion {
-		return fmt.Errorf("Unmatched cache version %s", manifest.Annotations[utils.ManifestNydusCache])
+	// Discard the cache if mismatched version
+	if manifest.Annotations[utils.ManifestNydusCache] != cache.opt.Version {
+		return fmt.Errorf(
+			"unmatched cache image version %s, required to be %s",
+			manifest.Annotations[utils.ManifestNydusCache], cache.opt.Version,
+		)
 	}
 
-	cache.importLayersToRecords(manifest.Layers)
+	// Discard the cache if mismatched RAFS FsVersion
+	// If utils.LayerAnnotationNydusFsVersion == "" and cache.opt.FsVersion == "5",
+	// it should be old cache image.
+	if manifest.Annotations[utils.LayerAnnotationNydusFsVersion] != cache.opt.FsVersion &&
+		(manifest.Annotations[utils.LayerAnnotationNydusFsVersion] != "" || cache.opt.FsVersion != "5") {
+		return fmt.Errorf(
+			"unmatched fs version %s, required to be %s",
+			manifest.Annotations[utils.LayerAnnotationNydusFsVersion], cache.opt.FsVersion,
+		)
+	}
+
+	cache.importRecordsFromLayers(manifest.Layers)
 
 	return nil
 }
 
 // Check checks bootstrap & blob layer exists in registry or storage backend
-func (cache *Cache) Check(ctx context.Context, layerChainID digest.Digest) (*CacheRecord, io.ReadCloser, io.ReadCloser, error) {
+func (cache *Cache) Check(ctx context.Context, layerChainID digest.Digest) (*Record, io.ReadCloser, io.ReadCloser, error) {
 	record, ok := cache.pulledRecords[layerChainID]
 	if !ok {
 		return nil, nil, nil, nil
@@ -352,31 +491,38 @@ func (cache *Cache) Check(ctx context.Context, layerChainID digest.Digest) (*Cac
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "Check bootstrap layer")
 	}
+	defer func() {
+		if err != nil {
+			bootstrapReader.Close()
+		}
+	}()
+
+	var exist bool
+	var blobReader io.ReadCloser
 
 	// Check blob layer on cache
 	if record.NydusBlobDesc != nil {
 		if cache.opt.Backend.Type() == backend.RegistryBackend {
-			blobReader, err := cache.remote.Pull(ctx, *record.NydusBlobDesc, true)
+			blobReader, err = cache.remote.Pull(ctx, *record.NydusBlobDesc, true)
 			if err != nil {
 				return nil, nil, nil, errors.Wrap(err, "Check blob layer")
 			}
-			return record, bootstrapReader, blobReader, nil
+		} else {
+			exist, err = cache.opt.Backend.Check(record.NydusBlobDesc.Digest.Hex())
+			if err != nil {
+				return nil, nil, nil, errors.Wrap(err, "Check blob on backend")
+			} else if !exist {
+				err = errors.New("Not found blob on backend")
+				return nil, nil, nil, err
+			}
 		}
-		exist, err := cache.opt.Backend.Check(record.NydusBlobDesc.Digest.Hex())
-		if err != nil {
-			return nil, nil, nil, errors.Wrap(err, "Check blob on backend")
-		}
-		if !exist {
-			return nil, nil, nil, errors.New("Not found blob on backend")
-		}
-		return record, bootstrapReader, nil, nil
 	}
 
-	return record, bootstrapReader, nil, nil
+	return record, bootstrapReader, blobReader, nil
 }
 
 // Record puts new bootstrap & blob layer to cache record, it's a limited queue.
-func (cache *Cache) Record(records []*CacheRecord) {
+func (cache *Cache) Record(records []*Record) {
 	moveFront := map[digest.Digest]bool{}
 	for _, record := range records {
 		moveFront[record.SourceChainID] = true

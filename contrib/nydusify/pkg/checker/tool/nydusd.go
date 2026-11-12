@@ -9,27 +9,33 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"text/template"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type NydusdConfig struct {
-	EnablePrefetch bool
-	NydusdPath     string
-	BootstrapPath  string
-	ConfigPath     string
-	BackendType    string
-	BackendConfig  string
-	BlobCacheDir   string
-	APISockPath    string
-	MountPath      string
+	EnablePrefetch               bool
+	NydusdPath                   string
+	BootstrapPath                string
+	ConfigPath                   string
+	BackendType                  string
+	BackendConfig                string
+	ExternalBackendConfigPath    string
+	ExternalBackendProxyCacheDir string
+	BlobCacheDir                 string
+	APISockPath                  string
+	MountPath                    string
+	Mode                         string
+	DigestValidate               bool
 }
 
 // Nydusd runs nydusd binary.
@@ -48,6 +54,9 @@ var configTpl = `
 			"type": "{{.BackendType}}",
 			"config": {{.BackendConfig}}
 		},
+		"external_backend": {
+			"config_path": "{{.ExternalBackendConfigPath}}"
+		},
 		"cache": {
 			"type": "blobcache",
 			"config": {
@@ -55,14 +64,14 @@ var configTpl = `
 			}
 		}
 	},
-	"mode": "cached",
+	"mode": "{{.Mode}}",
 	"iostats_files": false,
 	"fs_prefetch": {
 		"enable": {{.EnablePrefetch}},
 		"threads_count": 10,
 		"merging_size": 131072
 	},
-	"digest_validate": true,
+	"digest_validate": {{.DigestValidate}},
 	"enable_xattr": true
 }
 `
@@ -74,15 +83,16 @@ func makeConfig(conf NydusdConfig) error {
 	if conf.BackendType == "" {
 		conf.BackendType = "localfs"
 		conf.BackendConfig = `{"dir": "/fake"}`
-		conf.EnablePrefetch = false
 	} else {
-		conf.EnablePrefetch = true
+		if conf.BackendConfig == "" {
+			return errors.Errorf("empty backend configuration string")
+		}
 	}
 	if err := tpl.Execute(&ret, conf); err != nil {
-		return errors.New("prepare config template for Nydusd")
+		return errors.New("failed to prepare configuration file for Nydusd")
 	}
 
-	if err := ioutil.WriteFile(conf.ConfigPath, ret.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(conf.ConfigPath, ret.Bytes(), 0644); err != nil {
 		return errors.New("write config file for Nydusd")
 	}
 
@@ -125,7 +135,7 @@ func checkReady(ctx context.Context, sock string) (<-chan bool, error) {
 			}
 			defer resp.Body.Close()
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				continue
 			}
@@ -147,7 +157,7 @@ func checkReady(ctx context.Context, sock string) (<-chan bool, error) {
 
 func NewNydusd(conf NydusdConfig) (*Nydusd, error) {
 	if err := makeConfig(conf); err != nil {
-		return nil, errors.New("create config file for Nydusd")
+		return nil, errors.Wrapf(err, "failed to create configuration file for Nydusd")
 	}
 	return &Nydusd{
 		NydusdConfig: conf,
@@ -155,10 +165,13 @@ func NewNydusd(conf NydusdConfig) (*Nydusd, error) {
 }
 
 func (nydusd *Nydusd) Mount() error {
-	nydusd.Umount()
+	// Umount is called to clean up mountpoint in nydusd's mount path
+	// Flag is used as a hint to prevent redundant error message
+	nydusd.Umount(true)
 
-	var args []string
-	args = []string{
+	args := []string{
+		// For backward compatibility, do not use "fuse" subcommand in checker.
+		// "fuse",
 		"--config",
 		nydusd.ConfigPath,
 		"--mountpoint",
@@ -168,10 +181,11 @@ func (nydusd *Nydusd) Mount() error {
 		"--apisock",
 		nydusd.APISockPath,
 		"--log-level",
-		"error",
+		"warn",
 	}
 
 	cmd := exec.Command(nydusd.NydusdPath, args...)
+	logrus.Debugf("Command: %s %s", nydusd.NydusdPath, strings.Join(args, " "))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -195,18 +209,21 @@ func (nydusd *Nydusd) Mount() error {
 		}
 	case <-ready:
 		return nil
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		return errors.New("timeout to wait Nydusd ready")
 	}
 
 	return nil
 }
 
-func (nydusd *Nydusd) Umount() error {
+func (nydusd *Nydusd) Umount(silent bool) error {
 	if _, err := os.Stat(nydusd.MountPath); err == nil {
 		cmd := exec.Command("umount", nydusd.MountPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+
+		if !silent {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+		}
 		if err := cmd.Run(); err != nil {
 			return err
 		}

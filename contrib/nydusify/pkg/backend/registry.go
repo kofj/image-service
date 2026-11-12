@@ -2,19 +2,25 @@ package backend
 
 import (
 	"context"
+	"io"
 	"os"
 
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/remote"
+	"github.com/containerd/containerd/v2/core/remotes"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/remote"
 )
 
 type Registry struct {
 	remote *remote.Remote
 }
 
-func (r *Registry) Upload(ctx context.Context, blobID, blobPath string,
-	size int64) (*ocispec.Descriptor, error) {
+func (r *Registry) Upload(
+	ctx context.Context, blobID, blobPath string, size int64, _ bool,
+) (*ocispec.Descriptor, error) {
+	// The `forcePush` option is useless for registry backend, because
+	// the blob existed in registry can't be pushed again.
 
 	desc := blobDesc(size, blobID)
 
@@ -29,18 +35,32 @@ func (r *Registry) Upload(ctx context.Context, blobID, blobPath string,
 	}
 
 	return &desc, nil
-
 }
 
-func (r *Registry) Check(blobID string) (bool, error) {
+func (r *Registry) Finalize(_ bool) error {
+	return nil
+}
 
+func (r *Registry) Check(_ string) (bool, error) {
 	return true, nil
 }
 
-func (r *Registry) Type() BackendType {
+func (r *Registry) Type() Type {
 	return RegistryBackend
 }
 
-func newRegistryBackend(rawConfig []byte, remote *remote.Remote) (Backend, error) {
+func (r *Registry) RangeReader(_ string) (remotes.RangeReadCloser, error) {
+	panic("not implemented")
+}
+
+func (r *Registry) Reader(_ string) (io.ReadCloser, error) {
+	panic("not implemented")
+}
+
+func (r *Registry) Size(_ string) (int64, error) {
+	panic("not implemented")
+}
+
+func newRegistryBackend(_ []byte, remote *remote.Remote) (Backend, error) {
 	return &Registry{remote: remote}, nil
 }

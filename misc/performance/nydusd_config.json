@@ -1,0 +1,30 @@
+{
+    "device": {
+        "backend": {
+            "type": "registry",
+            "config": {
+                "scheme": "http",
+                "host": "localhost:5077",
+                "skip_verify": true,
+                "timeout": 5,
+                "connect_timeout": 5,
+                "retry_limit": 4
+            }
+        },
+        "cache": {
+            "type": "blobcache",
+            "config": {
+                "work_dir": "/var/lib/containerd/io.containerd.snapshotter.v1.nydus/cache"
+            }
+        }
+    },
+    "mode": "direct",
+    "digest_validate": false,
+    "enable_xattr": true,
+    "iostats_files": false,
+    "access_pattern": false,
+    "latest_read_files": false,
+    "fs_prefetch": {
+        "enable": false
+    }
+}

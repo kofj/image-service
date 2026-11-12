@@ -12,43 +12,50 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/checker/rule"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/checker/tool"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/converter/provider"
-	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/parser"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/checker/rule"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
 // Opt defines Checker options.
-// Note: target is the Nydus image reference.
+// Note: target is the nydus image reference.
 type Opt struct {
-	WorkDir        string
-	Source         string
-	Target         string
-	SourceInsecure bool
-	TargetInsecure bool
+	WorkDir string
+
+	Source              string
+	Target              string
+	SourceInsecure      bool
+	TargetInsecure      bool
+	SourceBackendType   string
+	SourceBackendConfig string
+	TargetBackendType   string
+	TargetBackendConfig string
+
 	MultiPlatform  bool
 	NydusImagePath string
 	NydusdPath     string
-	BackendType    string
-	BackendConfig  string
+	ExpectedArch   string
 }
 
-// Checker validates Nydus image manifest, bootstrap and mounts filesystem
-// by Nydusd to compare file metadata and data with OCI image.
+// Checker validates nydus image manifest, bootstrap and mounts filesystem
+// by nydusd to compare file metadata and data between OCI / nydus image.
 type Checker struct {
 	Opt
 	sourceParser *parser.Parser
 	targetParser *parser.Parser
 }
 
-// New creates Checker instance, target is the Nydus image reference.
+// New creates Checker instance, target is the nydus image reference.
 func New(opt Opt) (*Checker, error) {
-	// TODO: support source and target resolver
 	targetRemote, err := provider.DefaultRemote(opt.Target, opt.TargetInsecure)
 	if err != nil {
-		return nil, errors.Wrap(err, "Init target image parser")
+		return nil, errors.Wrap(err, "init target image parser")
 	}
-	targetParser := parser.New(targetRemote)
+	targetParser, err := parser.New(targetRemote, opt.ExpectedArch)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create parser")
+	}
 
 	var sourceParser *parser.Parser
 	if opt.Source != "" {
@@ -56,7 +63,10 @@ func New(opt Opt) (*Checker, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "Init source image parser")
 		}
-		sourceParser = parser.New(sourceRemote)
+		sourceParser, err = parser.New(sourceRemote, opt.ExpectedArch)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create parser")
+		}
 	}
 
 	checker := &Checker{
@@ -68,12 +78,29 @@ func New(opt Opt) (*Checker, error) {
 	return checker, nil
 }
 
-// Check checks Nydus image, and outputs image information to work
+// Check checks nydus image, and outputs image information to work
 // directory, the check workflow is composed of various rules.
 func (checker *Checker) Check(ctx context.Context) error {
+	if err := checker.check(ctx); err != nil {
+		if utils.RetryWithHTTP(err) {
+			if checker.sourceParser != nil {
+				checker.sourceParser.Remote.MaybeWithHTTP(err)
+			}
+			checker.targetParser.Remote.MaybeWithHTTP(err)
+			return checker.check(ctx)
+		}
+		return err
+	}
+	return nil
+}
+
+// Check checks nydus image, and outputs image information to work
+// directory, the check workflow is composed of various rules.
+func (checker *Checker) check(ctx context.Context) error {
+	logrus.WithField("image", checker.targetParser.Remote.Ref).Infof("parsing image")
 	targetParsed, err := checker.targetParser.Parse(ctx)
 	if err != nil {
-		return errors.Wrap(err, "parse Nydus image")
+		return errors.Wrap(err, "parse nydus image")
 	}
 
 	var sourceParsed *parser.Parsed
@@ -82,57 +109,66 @@ func (checker *Checker) Check(ctx context.Context) error {
 		if err != nil {
 			return errors.Wrap(err, "parse source image")
 		}
-	} else {
-		sourceParsed = targetParsed
 	}
 
 	if err := os.RemoveAll(checker.WorkDir); err != nil {
 		return errors.Wrap(err, "clean up work directory")
 	}
 
-	if err := os.MkdirAll(filepath.Join(checker.WorkDir, "fs"), 0755); err != nil {
-		return errors.Wrap(err, "create work directory")
+	if sourceParsed != nil {
+		if err := checker.Output(ctx, sourceParsed, filepath.Join(checker.WorkDir, "source")); err != nil {
+			return errors.Wrapf(err, "output image information: %s", sourceParsed.Remote.Ref)
+		}
 	}
 
-	if err := checker.Output(ctx, sourceParsed, targetParsed, checker.WorkDir); err != nil {
-		return errors.Wrap(err, "output image information")
+	if targetParsed != nil {
+		if err := checker.Output(ctx, targetParsed, filepath.Join(checker.WorkDir, "target")); err != nil {
+			return errors.Wrapf(err, "output image information: %s", targetParsed.Remote.Ref)
+		}
 	}
 
 	rules := []rule.Rule{
 		&rule.ManifestRule{
-			SourceParsed:  sourceParsed,
-			TargetParsed:  targetParsed,
-			MultiPlatform: checker.MultiPlatform,
+			SourceParsed: sourceParsed,
+			TargetParsed: targetParsed,
 		},
 		&rule.BootstrapRule{
-			Parsed:          targetParsed,
-			NydusImagePath:  checker.NydusImagePath,
-			BootstrapPath:   filepath.Join(checker.WorkDir, "nydus_bootstrap"),
-			DebugOutputPath: filepath.Join(checker.WorkDir, "nydus_bootstrap_debug.json"),
+			WorkDir:        checker.WorkDir,
+			NydusImagePath: checker.NydusImagePath,
+
+			SourceParsed:        sourceParsed,
+			TargetParsed:        targetParsed,
+			SourceBackendType:   checker.SourceBackendType,
+			SourceBackendConfig: checker.SourceBackendConfig,
+			TargetBackendType:   checker.TargetBackendType,
+			TargetBackendConfig: checker.TargetBackendConfig,
 		},
 		&rule.FilesystemRule{
-			Source:          checker.Source,
-			SourceMountPath: filepath.Join(checker.WorkDir, "fs/source_mounted"),
-			NydusdConfig: tool.NydusdConfig{
-				NydusdPath:    checker.NydusdPath,
-				BackendType:   checker.BackendType,
-				BackendConfig: checker.BackendConfig,
-				BootstrapPath: filepath.Join(checker.WorkDir, "nydus_bootstrap"),
-				ConfigPath:    filepath.Join(checker.WorkDir, "fs/nydusd_config.json"),
-				BlobCacheDir:  filepath.Join(checker.WorkDir, "fs/nydus_blobs"),
-				MountPath:     filepath.Join(checker.WorkDir, "fs/nydus_mounted"),
-				APISockPath:   filepath.Join(checker.WorkDir, "fs/nydus_api.sock"),
+			WorkDir:    checker.WorkDir,
+			NydusdPath: checker.NydusdPath,
+
+			SourceImage: &rule.Image{
+				Parsed:   sourceParsed,
+				Insecure: checker.SourceInsecure,
 			},
+			TargetImage: &rule.Image{
+				Parsed:   targetParsed,
+				Insecure: checker.TargetInsecure,
+			},
+			SourceBackendType:   checker.SourceBackendType,
+			SourceBackendConfig: checker.SourceBackendConfig,
+			TargetBackendType:   checker.TargetBackendType,
+			TargetBackendConfig: checker.TargetBackendConfig,
 		},
 	}
 
 	for _, rule := range rules {
 		if err := rule.Validate(); err != nil {
-			return errors.Wrapf(err, "validate rule %s", rule.Name())
+			return errors.Wrapf(err, "validate %s failed", rule.Name())
 		}
 	}
 
-	logrus.Infof("Verified Nydus image %s", checker.targetParser.Remote.Ref)
+	logrus.Info("verified image")
 
 	return nil
 }

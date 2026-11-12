@@ -1,0 +1,1 @@
+This file is no longer maintained and has migrated to community repositories. Please refer to the [community repository](https://github.com/dragonflyoss/community/blob/master/roles/Maintainers.md) for the latest maintainers list.

@@ -1,262 +1,279 @@
+// Copyright 2022 Alibaba Cloud. All rights reserved.
 // Copyright 2020 Ant Group. All rights reserved.
 // Copyright © 2019 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::io::Result;
-use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread;
-use std::time::SystemTime;
+use std::io;
+use std::sync::mpsc::{RecvError, SendError};
 
-use std::os::unix::io::AsRawFd;
+use serde::Deserialize;
+use serde_json::Error as SerdeError;
+use thiserror::Error;
 
-use http::uri::Uri;
-use url::Url;
+use crate::BlobCacheEntry;
 
-use micro_http::{HttpServer, MediaType, Request, Response, StatusCode};
-use vmm_sys_util::eventfd::EventFd;
-
-use crate::http_endpoint::{
-    error_response, ApiError, ApiRequest, ApiResponse, EventsHandler, ExitHandler, FsBackendInfo,
-    HttpError, HttpResult, InfoHandler, MetricsBackendHandler, MetricsBlobcacheHandler,
-    MetricsFilesHandler, MetricsHandler, MetricsInflightHandler, MetricsPatternHandler,
-    MountHandler, SendFuseFdHandler, TakeoverHandler,
-};
-
-const HTTP_ROOT: &str = "/api/v1";
-
-/// An HTTP endpoint handler interface
-pub trait EndpointHandler: Sync + Send {
-    /// Handles an HTTP request.
-    /// After parsing the request, the handler could decide to send an
-    /// associated API request down to the Nydusd API server to e.g. get current working status.
-    /// The request will block waiting for an answer from the
-    /// API server and translate that into an HTTP response.
-    fn handle_request(
-        &self,
-        req: &Request,
-        kicker: &dyn Fn(ApiRequest) -> ApiResponse,
-    ) -> HttpResult;
+/// Errors related to Metrics.
+#[derive(Error, Debug)]
+pub enum MetricsError {
+    #[error("no counter found for the metric")]
+    NoCounter,
+    #[error("failed to serialize metric: {0:?}")]
+    Serialize(#[source] SerdeError),
 }
 
-/// An HTTP routes structure.
-pub struct HttpRoutes {
-    /// routes is a hash table mapping endpoint URIs to their endpoint handlers.
-    pub routes: HashMap<String, Box<dyn EndpointHandler + Sync + Send>>,
+/// Mount a filesystem.
+#[derive(Clone, Deserialize, Debug)]
+pub struct ApiMountCmd {
+    /// Path to source of the filesystem.
+    pub source: String,
+    /// Type of filesystem.
+    #[serde(default)]
+    pub fs_type: String,
+    /// Configuration for the filesystem.
+    pub config: String,
+    /// List of files to prefetch.
+    #[serde(default)]
+    pub prefetch_files: Option<Vec<String>>,
 }
 
-macro_rules! endpoint {
-    ($path:expr) => {
-        format!("{}{}", HTTP_ROOT, $path)
-    };
+/// Umount a mounted filesystem.
+#[derive(Clone, Deserialize, Debug)]
+pub struct ApiUmountCmd {
+    /// Path of mountpoint.
+    pub mountpoint: String,
 }
 
-lazy_static! {
-    /// HTTP_ROUTES contain all the cloud-hypervisor HTTP routes.
-    pub static ref HTTP_ROUTES: HttpRoutes = {
-        let mut r = HttpRoutes {
-            routes: HashMap::new(),
-        };
-
-        r.routes.insert(endpoint!("/daemon"), Box::new(InfoHandler{}));
-        r.routes.insert(endpoint!("/daemon/events"), Box::new(EventsHandler{}));
-        r.routes.insert(endpoint!("/daemon/backend"), Box::new(FsBackendInfo{}));
-        r.routes.insert(endpoint!("/daemon/exit"), Box::new(ExitHandler{}));
-        r.routes.insert(endpoint!("/daemon/fuse/sendfd"), Box::new(SendFuseFdHandler{}));
-        r.routes.insert(endpoint!("/daemon/fuse/takeover"), Box::new(TakeoverHandler{}));
-        r.routes.insert(endpoint!("/mount"), Box::new(MountHandler{}));
-        r.routes.insert(endpoint!("/metrics"), Box::new(MetricsHandler{}));
-        r.routes.insert(endpoint!("/metrics/files"), Box::new(MetricsFilesHandler{}));
-        r.routes.insert(endpoint!("/metrics/pattern"), Box::new(MetricsPatternHandler{}));
-        r.routes.insert(endpoint!("/metrics/backend"), Box::new(MetricsBackendHandler{}));
-        r.routes.insert(endpoint!("/metrics/blobcache"), Box::new(MetricsBlobcacheHandler{}));
-        r.routes.insert(endpoint!("/metrics/inflight"), Box::new(MetricsInflightHandler{}));
-        r
-    };
+/// Set/update daemon configuration.
+#[derive(Clone, Deserialize, Debug)]
+pub struct DaemonConf {
+    /// Logging level: Off, Error, Warn, Info, Debug, Trace.
+    pub log_level: String,
 }
 
-fn kick_api_server(
-    api_evt: &EventFd,
-    to_api: &Sender<ApiRequest>,
-    from_api: &Receiver<ApiResponse>,
-    request: ApiRequest,
-) -> ApiResponse {
-    to_api.send(request).map_err(ApiError::RequestSend)?;
-    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
-    from_api.recv().map_err(ApiError::ResponseRecv)?
+// Set/update global configuration.
+pub type Config = std::collections::HashMap<String, String>;
+
+/// Identifier for cached blob objects.
+///
+/// Domains are used to control the blob sharing scope. All blobs associated with the same domain
+/// will be shared/reused, but blobs associated with different domains are isolated.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BlobCacheObjectId {
+    /// Domain identifier for the object.
+    #[serde(default)]
+    pub domain_id: String,
+    /// Blob identifier for the object.
+    #[serde(default)]
+    pub blob_id: String,
 }
 
-// Example:
-// <-- GET /
-// --> GET / 200 835ms 746b
-//
+#[derive(Debug)]
+pub enum ApiRequest {
+    /// Set daemon configuration.
+    ConfigureDaemon(DaemonConf),
+    /// Get daemon information.
+    GetDaemonInfo,
+    /// Get daemon global events.
+    GetEvents,
+    /// Stop the daemon.
+    Exit,
+    /// Start the daemon.
+    Start,
+    /// Send fuse fd to new daemon.
+    SendFuseFd,
+    /// Take over fuse fd from old daemon instance.
+    TakeoverFuseFd,
 
-fn trace_api_begin(request: &micro_http::Request) {
-    info!("<--- {:?} {:?}", request.method(), request.uri());
+    // Filesystem Related
+    /// Mount a filesystem.
+    Mount(String, ApiMountCmd),
+    /// Remount a filesystem.
+    Remount(String, ApiMountCmd),
+    /// Unmount a filesystem.
+    Umount(String),
+
+    /// Get storage backend metrics.
+    ExportBackendMetrics(Option<String>),
+    /// Get blob cache metrics.
+    ExportBlobcacheMetrics(Option<String>),
+
+    // Nydus API v1 requests
+    /// Get filesystem global metrics.
+    ExportFsGlobalMetrics(Option<String>),
+    /// Get filesystem access pattern log.
+    ExportFsAccessPatterns(Option<String>),
+    /// Get filesystem backend information.
+    ExportFsBackendInfo(String),
+    /// Get filesystem file metrics.
+    ExportFsFilesMetrics(Option<String>, bool),
+    /// Get information about filesystem inflight requests.
+    ExportFsInflightMetrics,
+    /// Get global configuration.
+    GetConfig(Option<String>),
+    /// Update global configuration.
+    UpdateConfig(Option<String>, Config),
+
+    // Nydus API v2
+    /// Get daemon information excluding filesystem backends.
+    GetDaemonInfoV2,
+    /// Create a blob cache entry
+    CreateBlobObject(Box<BlobCacheEntry>),
+    /// Get information about blob cache entries
+    GetBlobObject(BlobCacheObjectId),
+    /// Delete a blob cache entry
+    DeleteBlobObject(BlobCacheObjectId),
+    /// Delete a blob cache file
+    DeleteBlobFile(String),
 }
-fn trace_api_end(
-    response: &micro_http::Response,
-    method: micro_http::Method,
-    recv_time: SystemTime,
-) {
-    let elapse = SystemTime::now().duration_since(recv_time);
-    info!(
-        "---> {:?} Status Code: {:?}, Elapse: {:?}, Body Size: {:?}",
-        method,
-        response.status(),
-        elapse,
-        response.content_length()
-    );
+
+/// Kinds for daemon related error messages.
+#[derive(Debug)]
+pub enum DaemonErrorKind {
+    /// Service not ready yet.
+    NotReady,
+    /// Generic errors.
+    Other(String),
+    /// Message serialization/deserialization related errors.
+    Serde(SerdeError),
+    /// Unexpected event type.
+    UnexpectedEvent(String),
+    /// Can't upgrade the daemon.
+    UpgradeManager(String),
+    /// Unsupported requests.
+    Unsupported,
 }
 
-fn handle_http_request(
-    request: &Request,
-    api_notifier: &EventFd,
-    to_api: &Sender<ApiRequest>,
-    from_api: &Receiver<ApiResponse>,
-) -> Response {
-    trace_api_begin(request);
-    let begin_time = SystemTime::now();
-
-    // Micro http should ensure that req path is legal.
-    let uri_parsed = request.uri().get_abs_path().parse::<Uri>();
-
-    let mut response = match uri_parsed {
-        Ok(uri) => match HTTP_ROUTES.routes.get(uri.path()) {
-            Some(route) => route
-                .handle_request(&request, &|r| {
-                    kick_api_server(api_notifier, to_api, from_api, r)
-                })
-                .unwrap_or_else(|err| error_response(err, StatusCode::BadRequest)),
-            None => error_response(HttpError::NoRoute, StatusCode::NotFound),
-        },
-        Err(e) => {
-            error!("URI can't be parsed, {}", e);
-            error_response(HttpError::BadRequest, StatusCode::BadRequest)
-        }
-    };
-
-    response.set_server("Nydus API");
-    response.set_content_type(MediaType::ApplicationJson);
-
-    trace_api_end(&response, request.method(), begin_time);
-
-    response
+/// Kinds for metrics related error messages.
+#[derive(Debug)]
+pub enum MetricsErrorKind {
+    /// Generic daemon related errors.
+    Daemon(DaemonErrorKind),
+    /// Errors related to metrics implementation.
+    Stats(MetricsError),
 }
 
-pub fn extract_query_part(req: &Request, key: &str) -> Option<String> {
-    // Splicing req.uri with "http:" prefix might look weird, but since it depends on
-    // crate `Url` to generate query_pairs HashMap, which is working on top of Url not Uri.
-    // Better that we can add query part support to Micro-http in the future. But
-    // right now, below way makes it easy to obtain query parts from uri.
-    let http_prefix: String = String::from("http:");
-    let url = Url::parse(&(http_prefix + req.uri().get_abs_path()))
-        .map_err(|e| {
-            error!("Can't parse request {:?}", e);
-            e
-        })
-        .ok()?;
-    let v: Option<String> = None;
-    for (k, v) in url.query_pairs() {
-        if k != key {
-            continue;
-        } else {
-            trace!("Got query part {:?}", (k, &v));
-            return Some(v.into_owned());
-        }
+#[derive(Error, Debug)]
+pub enum ApiError {
+    #[error("daemon internal error: {0:?}")]
+    DaemonAbnormal(DaemonErrorKind),
+    #[error("daemon events error: {0}")]
+    Events(String),
+    #[error("metrics error: {0:?}")]
+    Metrics(MetricsErrorKind),
+    #[error("failed to mount filesystem: {0:?}")]
+    MountFilesystem(DaemonErrorKind),
+    #[error("failed to send request to the API service: {0:?}")]
+    RequestSend(Box<SendError<Option<ApiRequest>>>),
+    #[error("failed to parse response payload type")]
+    ResponsePayloadType,
+    #[error("failed to receive response from the API service: {0:?}")]
+    ResponseRecv(#[from] RecvError),
+    #[error("failed to wake up the daemon: {0:?}")]
+    Wakeup(#[source] io::Error),
+}
+
+/// Specialized `std::result::Result` for API replies.
+pub type ApiResult<T> = std::result::Result<T, ApiError>;
+
+#[derive(Serialize)]
+pub enum ApiResponsePayload {
+    /// Filesystem backend metrics.
+    BackendMetrics(String),
+    /// Blobcache metrics.
+    BlobcacheMetrics(String),
+    /// Daemon version, configuration and status information in json.
+    DaemonInfo(String),
+    /// No data is sent on the channel.
+    Empty,
+    /// Global error events.
+    Events(String),
+
+    /// Filesystem global metrics, v1.
+    FsGlobalMetrics(String),
+    /// Filesystem per-file metrics, v1.
+    FsFilesMetrics(String),
+    /// Filesystem access pattern trace log, v1.
+    FsFilesPatterns(String),
+    // Filesystem Backend Information, v1.
+    FsBackendInfo(String),
+    // Filesystem Inflight Requests, v1.
+    FsInflightMetrics(String),
+    // Global configuration, v1.
+    Config(Config),
+
+    /// List of blob objects, v2
+    BlobObjectList(String),
+}
+
+/// Specialized version of [`std::result::Result`] for value returned by backend services.
+pub type ApiResponse = std::result::Result<ApiResponsePayload, ApiError>;
+
+/// HTTP error messages sent back to the clients.
+///
+/// The `HttpError` object will be sent back to client with `format!("{:?}", http_error)`.
+/// So unfortunately it implicitly becomes parts of the API, please keep it stable.
+#[derive(Debug)]
+pub enum HttpError {
+    // Daemon common related errors
+    /// Invalid HTTP request
+    BadRequest,
+    /// Failed to configure the daemon.
+    Configure(ApiError),
+    /// Failed to query information about daemon.
+    DaemonInfo(ApiError),
+    /// Failed to query global events.
+    Events(ApiError),
+    /// No handler registered for HTTP request URI
+    NoRoute,
+    /// Failed to parse HTTP request message body
+    ParseBody(SerdeError),
+    /// Query parameter is missed from the HTTP request.
+    QueryString(String),
+
+    /// Failed to mount filesystem.
+    Mount(ApiError),
+    /// Failed to remount filesystem.
+    Upgrade(ApiError),
+
+    // Metrics related errors
+    /// Failed to get backend metrics.
+    BackendMetrics(ApiError),
+    /// Failed to get blobcache metrics.
+    BlobcacheMetrics(ApiError),
+
+    // Filesystem related errors (v1)
+    /// Failed to get filesystem backend information
+    FsBackendInfo(ApiError),
+    /// Failed to get filesystem per-file metrics.
+    FsFilesMetrics(ApiError),
+    /// Failed to get global metrics.
+    GlobalMetrics(ApiError),
+    /// Failed to get information about inflight request
+    InflightMetrics(ApiError),
+    /// Failed to get filesystem file access trace.
+    Pattern(ApiError),
+
+    // Blob cache management related errors (v2)
+    /// Failed to create blob object
+    CreateBlobObject(ApiError),
+    /// Failed to delete blob object
+    DeleteBlobObject(ApiError),
+    /// Failed to delete blob file
+    DeleteBlobFile(ApiError),
+    /// Failed to list existing blob objects
+    GetBlobObjects(ApiError),
+}
+
+#[derive(Serialize, Debug)]
+pub(crate) struct ErrorMessage {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<ErrorMessage> for Vec<u8> {
+    fn from(msg: ErrorMessage) -> Self {
+        // Safe to unwrap since `ErrorMessage` must succeed in serialization
+        serde_json::to_vec(&msg).unwrap()
     }
-    v
-}
-
-const EVENT_UNIX_SOCKET: u64 = 1;
-const EVENT_HTTP_DIE: u64 = 2;
-
-/// Start a HTTP server parsing http requests and send to nydus API server a concrete
-/// request to operate nydus or fetch working status.
-/// The HTTP server sends request by `to_api` channel and wait for response from `from_api` channel
-/// `api_notifier` is used to notify an execution context to fetch above request and handle it.
-/// We can't forward signal to native rust thread, so we rely on `exit_evtfd` to notify
-/// the server to exit. Therefore, it adds the unix domain socket fd receiving http request
-/// to a global epoll_fd associated with a event_fd which will be used later to notify
-/// the server thread to exit.
-pub fn start_http_thread(
-    path: &str,
-    api_notifier: EventFd,
-    to_api: Sender<ApiRequest>,
-    from_api: Receiver<ApiResponse>,
-    exit_evtfd: EventFd,
-) -> Result<thread::JoinHandle<Result<()>>> {
-    // Try to remove existed unix domain socket
-    std::fs::remove_file(path).unwrap_or_default();
-    let socket_path = PathBuf::from(path);
-
-    let thread = thread::Builder::new()
-        .name("http-server".to_string())
-        .spawn(move || {
-            let epoll_fd = epoll::create(true).unwrap();
-
-            let mut server = HttpServer::new(socket_path).unwrap();
-            // Must start the server successfully or just die by panic
-            server.start_server().unwrap();
-            epoll::ctl(
-                epoll_fd,
-                epoll::ControlOptions::EPOLL_CTL_ADD,
-                server.epoll_fd(),
-                epoll::Event::new(epoll::Events::EPOLLIN, EVENT_UNIX_SOCKET),
-            )?;
-
-            epoll::ctl(
-                epoll_fd,
-                epoll::ControlOptions::EPOLL_CTL_ADD,
-                exit_evtfd.as_raw_fd(),
-                epoll::Event::new(epoll::Events::EPOLLIN, EVENT_HTTP_DIE),
-            )?;
-
-            let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 100];
-
-            info!("http server started");
-
-            'wait: loop {
-                let num = epoll::wait(epoll_fd, -1, events.as_mut_slice()).map_err(|e| {
-                    error!("Wait event error. {:?}", e);
-                    e
-                })?;
-
-                for event in &events[..num] {
-                    match event.data {
-                        EVENT_UNIX_SOCKET => match server.requests() {
-                            Ok(request_vec) => {
-                                for server_request in request_vec {
-                                    // Ignore error when sending response
-                                    server
-                                        .respond(server_request.process(|request| {
-                                            handle_http_request(
-                                                request,
-                                                &api_notifier,
-                                                &to_api,
-                                                &from_api,
-                                            )
-                                        }))
-                                        .unwrap_or_else(|e| {
-                                            error!("HTTP server error on response: {}", e)
-                                        });
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "HTTP server error on retrieving incoming request. Error: {}",
-                                    e
-                                );
-                            }
-                        },
-                        EVENT_HTTP_DIE => break 'wait Ok(()),
-                        _ => error!("Invalid event"),
-                    }
-                }
-            }
-        })?;
-
-    Ok(thread)
 }

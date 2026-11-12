@@ -7,89 +7,78 @@ package tool
 import (
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 
+	"github.com/containerd/containerd/v2/core/mount"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/tidwall/gjson"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
 )
 
-func run(cmd string, args ...string) error {
-	_cmd := exec.Command("sh", "-c", cmd)
-	_cmd.Stdout = os.Stdout
-	_cmd.Stderr = os.Stderr
-	return _cmd.Run()
+func mkMounts(dirs []string) []mount.Mount {
+	var options []string
+
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	if len(dirs) == 1 {
+		return []mount.Mount{
+			{
+				Source: dirs[0],
+				Type:   "bind",
+				Options: []string{
+					"ro",
+					"rbind",
+				},
+			},
+		}
+	}
+
+	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(dirs, ":")))
+	return []mount.Mount{
+		{
+			Type:    "overlay",
+			Source:  "overlay",
+			Options: options,
+		},
+	}
 }
 
-func runWithOutput(cmd string, args ...string) ([]byte, error) {
-	_cmd := exec.Command("sh", "-c", cmd)
-	_cmd.Stderr = os.Stderr
-	return _cmd.Output()
+func CheckImageType(parsed *parser.Parsed) string {
+	if parsed.NydusImage != nil {
+		return "nydus"
+	} else if parsed.OCIImage != nil {
+		return "oci"
+	}
+	return "unknown"
 }
 
 type Image struct {
-	Source string
-	Rootfs string
+	Layers       []ocispec.Descriptor
+	LayerBaseDir string
+	Rootfs       string
 }
 
-// FIXME: better to use `archive.Apply` in containerd package to
-// unpack image layer to overlayfs lowerdir.
-func (image *Image) Pull() error {
-	return run(fmt.Sprintf("docker pull %s", image.Source))
-}
-
-// Mount parses lowerdir and upperdir options of overlayfs from
-// `docker inspect` command output, and mounts rootfs of OCI image.
+// Mount mounts rootfs of OCI image.
 func (image *Image) Mount() error {
-	image.Umount()
-
-	output, err := runWithOutput(fmt.Sprintf("docker inspect %s", image.Source))
-	if err != nil {
-		return err
+	if err := os.MkdirAll(image.Rootfs, 0750); err != nil {
+		return errors.Wrap(err, "create rootfs dir")
 	}
 
-	dirs := []string{}
-	upperDir := gjson.Get(string(output), "0.GraphDriver.Data.UpperDir")
-	if !upperDir.Exists() {
-		return errors.New("Not found upper dir in image info")
-	}
-	dirs = append(dirs, strings.Split(upperDir.String(), ":")...)
-
-	lowerDir := gjson.Get(string(output), "0.GraphDriver.Data.LowerDir")
-	if lowerDir.Exists() {
-		dirs = append(dirs, strings.Split(lowerDir.String(), ":")...)
-	}
-	if len(dirs) == 1 {
-		dirs = append(dirs, image.Rootfs)
+	var dirs []string
+	count := len(image.Layers)
+	for idx := range image.Layers {
+		layerName := fmt.Sprintf("layer-%d", count-idx-1)
+		layerDir := filepath.Join(image.LayerBaseDir, layerName)
+		dirs = append(dirs, strings.ReplaceAll(layerDir, ":", "\\:"))
 	}
 
-	lowerOption := strings.Join(dirs, ":")
-
-	// Handle long options string overed 4096 chars, split them to
-	// two overlay mounts.
-	if len(lowerOption) >= 4096 {
-		half := (len(dirs) - 1) / 2
-		upperDirs := dirs[half+1:]
-		lowerDirs := dirs[:half+1]
-		lowerOverlay := image.Rootfs + "_lower"
-		if err := os.MkdirAll(lowerOverlay, 0755); err != nil {
-			return err
-		}
-		if err := run(fmt.Sprintf(
-			"mount -t overlay overlay -o lowerdir=%s %s",
-			strings.Join(upperDirs, ":"), lowerOverlay,
-		)); err != nil {
-			return err
-		}
-		lowerDirs = append(lowerDirs, lowerOverlay)
-		lowerOption = strings.Join(lowerDirs, ":")
-	}
-
-	if err := run(fmt.Sprintf(
-		"mount -t overlay overlay -o lowerdir=%s %s",
-		lowerOption, image.Rootfs,
-	)); err != nil {
-		return err
+	mounts := mkMounts(dirs)
+	if err := mount.All(mounts, image.Rootfs); err != nil {
+		return errors.Wrap(err, "mount source layer")
 	}
 
 	return nil
@@ -97,17 +86,19 @@ func (image *Image) Mount() error {
 
 // Umount umounts rootfs mountpoint of OCI image.
 func (image *Image) Umount() error {
-	lowerOverlay := image.Rootfs + "_lower"
-	if _, err := os.Stat(lowerOverlay); err == nil {
-		if err := run(fmt.Sprintf("umount %s", lowerOverlay)); err != nil {
-			return err
+	if _, err := os.Stat(image.Rootfs); err != nil {
+		if os.IsNotExist(err) {
+			return nil
 		}
+		return errors.Wrap(err, "stat rootfs")
 	}
 
-	if _, err := os.Stat(image.Rootfs); err == nil {
-		if err := run(fmt.Sprintf("umount %s", image.Rootfs)); err != nil {
-			return err
-		}
+	if err := mount.Unmount(image.Rootfs, 0); err != nil {
+		return errors.Wrap(err, "umount rootfs")
+	}
+
+	if err := os.RemoveAll(image.Rootfs); err != nil {
+		return errors.Wrap(err, "remove rootfs")
 	}
 
 	return nil
